@@ -1,0 +1,19 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+/build/
+/output/
+/tmp/
+/projects/
+/Meshcore for Bitcoiner
+/video-project.json
+/manual-edits.json
+/final-edits.json
+/faq-timeline.json
+/faq-reviewed-analysis.json
+/audio-reviewed-analysis.json
+/shorts.json
+/timeline.json
+/CoverBackground.jpg
+/Cover.jpg

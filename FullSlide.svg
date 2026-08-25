@@ -1,0 +1,6 @@
+<svg width="3840" height="2160" viewBox="0 0 3840 2160" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Bitcoin Austria full-slide presentation frame</title>
+  <desc>A clean 16:9 slide-focused layout with a green placement preview.</desc>
+  <image href="PiP.svg" width="3840" height="2160"/>
+  <rect id="slides-slot" x="320" y="240" width="3200" height="1800" fill="#00FF26"/>
+</svg>

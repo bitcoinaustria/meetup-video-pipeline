@@ -1,0 +1,7 @@
+<svg width="3840" height="2160" viewBox="0 0 3840 2160" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Bitcoin Austria picture-in-picture placement preview</title>
+  <desc>A 9:16 speaker slot and a 16:9 slide slot over the production background.</desc>
+  <image href="PiP.svg" width="3840" height="2160"/>
+  <rect id="speaker-slot" x="91" y="296" width="864" height="1536" fill="#00FF26"/>
+  <rect id="slides-slot" x="1019" y="296" width="2730.6667" height="1536" fill="#00FF26"/>
+</svg>

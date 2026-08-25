@@ -1,0 +1,22 @@
+<svg width="3840" height="2160" viewBox="0 0 3840 2160" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Bitcoin Austria presentation cover template</title>
+  <desc>Editable YouTube thumbnail template with a speaker background, short title, event details, and the current Bitcoin Austria mark.</desc>
+  <defs>
+    <linearGradient id="thumbnail-shade" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#000000" stop-opacity="0.08"/>
+      <stop offset="0.45" stop-color="#000000" stop-opacity="0.18"/>
+      <stop offset="0.66" stop-color="#000000" stop-opacity="0.72"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0.94"/>
+    </linearGradient>
+  </defs>
+  <rect width="3840" height="2160" fill="black"/>
+  <image href="CoverBackground.jpg" width="3840" height="2160"/>
+  <rect width="3840" height="2160" fill="url(#thumbnail-shade)"/>
+  <image href="CoverLogo.png" x="2850" y="150" width="700" height="160"/>
+  <g id="cover-copy" font-family="Arial, Helvetica, sans-serif">
+    <text id="cover-title" x="2200" y="880" fill="white" font-size="250" font-weight="700" letter-spacing="-8">Kurzer Titel</text>
+    <text id="cover-subtitle" x="2200" y="1075" fill="white" font-size="120" font-weight="600" letter-spacing="-2">der Präsentation</text>
+    <text id="cover-date" x="2200" y="1295" fill="white" fill-opacity="0.78" font-size="56" font-weight="600" letter-spacing="2">DATUM · UHRZEIT</text>
+    <text id="cover-location" x="2200" y="1410" fill="white" font-size="72" font-weight="700" letter-spacing="2">VERANSTALTUNGSORT</text>
+  </g>
+</svg>

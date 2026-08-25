@@ -1,0 +1,87 @@
+# Meetup Video Pipeline
+
+Local-first tooling for turning a single-camera meetup recording and a slide PDF into branded long-form video and vertical clips. The pipeline combines digital slides, smooth speaker tracking, fail-closed privacy blurring, conservative speech edits, full-cover FAQ cards, subtitles, chapters, thumbnails, and publishing copy without a traditional video editor.
+
+The included templates use Bitcoin Austria branding as a working example. Replace the background, logo, publishing voice, and organization fields for another organizer.
+
+The generator is presentation-neutral: event facts, source paths, terminology, timing, review decisions, and output names live in a project manifest and its project folder. It is macOS-first because person detection and OCR currently use Apple Vision; FFmpeg composition and most Python tooling are portable.
+
+## Requirements
+
+- Python 3.11+
+- FFmpeg and ffprobe
+- Poppler (`pdftotext` and `pdftoppm`)
+- Xcode Command Line Tools for Apple Vision detection and OCR
+- [whisper.cpp](https://github.com/ggml-org/whisper.cpp) plus a local Large-v3 model
+- TypeWhisper with Parakeet TDT v3 when the secondary audio pass is required
+- Codex CLI or Claude CLI for grounded FAQ and speech-edit review
+
+On macOS:
+
+```sh
+brew install ffmpeg poppler
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+```
+
+## Start a project
+
+```sh
+make init NAME=my-talk
+cp /path/to/recording.mp4 projects/my-talk/source/video.mp4
+cp /path/to/slides.pdf projects/my-talk/source/slides.pdf
+```
+
+Edit `projects/my-talk/project.json`: title, speaker first name, presentation start, technical transcription terms, source geometry, and project-local artifact paths. Paths in a manifest resolve relative to that manifest, so the complete `projects/my-talk/` directory can be archived to shared storage and restored on another checkout.
+
+The initial camera/slide calibration produces the timeline, slide images, speaker track, and two privacy masks referenced by the manifest. These physical-camera values stay project-specific; the render and edit pipeline never assumes one event's crop or speaker position applies to another. See the [agent production runbook](.agents/skills/meetup-video-production/SKILL.md) for the exact gates and artifact contract.
+
+## Reproducible workflow
+
+Every command accepts the same manifest through `PROJECT`:
+
+```sh
+make check PROJECT=projects/my-talk/project.json
+make preview PROJECT=projects/my-talk/project.json START=260 DURATION=60
+make audio PROJECT=projects/my-talk/project.json
+make faq PROJECT=projects/my-talk/project.json
+make final PROJECT=projects/my-talk/project.json
+make shorts PROJECT=projects/my-talk/project.json
+make copy PROJECT=projects/my-talk/project.json
+make chapters PROJECT=projects/my-talk/project.json
+make validate PROJECT=projects/my-talk/project.json
+```
+
+`make final` rebuilds context-gated speech edits and audience FAQ coverage, renders at `final_resolution`, validates stereo audio and visible frames, then atomically replaces the configured final output. `make release` additionally regenerates grounded publishing copy. A short 1080p preview is the required approval gate before an expensive production render.
+
+## Output layout
+
+The output root contains categories instead of loose artifacts:
+
+```text
+output/
+├── final/       publishable long-form renders
+├── shorts/      publishable vertical clips and SRT subtitles
+├── thumbnails/  approved thumbnail variants
+├── metadata/    publishing copy and YouTube chapters
+└── debug/       previews, review renders, and logs; safe to delete
+```
+
+Source media remains in the project's `source/` directory. Intermediate assets belong in `build/` or `tmp/`, not in `output/`.
+
+## Safety and edit contract
+
+- One source-time EDL drives audio, video, tracking, slides, FAQ insertion, chapters, and Shorts.
+- Multi-pass speech editing cuts only when deterministic, acoustic, speaker-context, and semantic checks agree.
+- Two-channel input is inspected before processing because stereo can contain two independent mono microphones.
+- Ambiguous speaker identity or overlapping people trigger full-camera blur; privacy fails closed.
+- Camera timestamps remain the render clock, preventing duplicate catch-up frames around hard cuts.
+- Source media is immutable. Caches live in `build/` and `tmp/`; release artifacts live in categorized `output/` subdirectories.
+
+`video-project.example.json` documents all reusable settings. Local project folders and review decisions are ignored by Git; branded layout templates and generator code are versioned.
+
+See [VISION.md](VISION.md) for product direction and [AGENTS.md](AGENTS.md) for contributor rules.
+
+## License
+
+The generator and templates are licensed under [MIT](LICENSE). The Bitcoin Austria name, marks, and listed [brand assets](BRAND_ASSETS.md) are expressly excluded from that license.
