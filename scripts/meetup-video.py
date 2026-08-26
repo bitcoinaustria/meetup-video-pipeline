@@ -397,7 +397,7 @@ def full_blur_sample_times(mask: Path) -> list[float]:
         check=True,
         capture_output=True,
     ).stdout
-    return [(index + 0.5) / 2 for index, value in enumerate(samples) if value >= 220]
+    return [index / 2 for index, value in enumerate(samples) if value >= 220]
 
 
 def high_frequency_energy(frame: np.ndarray) -> float:

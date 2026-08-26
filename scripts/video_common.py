@@ -410,7 +410,7 @@ def run_structured_model(provider: str, schema: dict, prompt: str, timeout: floa
         if provider == "claude":
             command = [
                 "claude", "-p", "--safe-mode", "--setting-sources", "user",
-                "--strict-mcp-config", "--mcp-config", "{}", "--tools", "",
+                "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--tools", "",
                 "--permission-mode", "dontAsk", "--no-session-persistence",
                 "--output-format", "json", "--json-schema", json.dumps(schema),
             ]

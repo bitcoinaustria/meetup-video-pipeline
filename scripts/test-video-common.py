@@ -62,6 +62,9 @@ with patch("video_common.subprocess.run") as model_run:
     assert run_structured_model("claude", schema, large_prompt) == {"ok": True}
     assert model_run.call_args.kwargs["input"] == large_prompt
     assert large_prompt not in model_run.call_args.args[0]
+    claude_command = model_run.call_args.args[0]
+    assert claude_command[claude_command.index("--mcp-config") + 1] == '{"mcpServers":{}}'
+    assert claude_command[claude_command.index("--tools") + 1] == ""
 with patch("video_common.subprocess.run") as model_run:
     model_run.return_value = SimpleNamespace(stdout=json.dumps({"ok": True}))
     assert run_structured_model("codex", schema, large_prompt) == {"ok": True}
