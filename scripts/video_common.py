@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -31,7 +32,7 @@ def resource_budget(
         "jobs": workers,
         "gpu_jobs": gpu_workers,
         "render_jobs": render_workers,
-        "threads_per_job": max(1, cpus // workers),
+        "threads_per_job": max(1, cpus // render_workers),
     }
 
 
@@ -94,7 +95,8 @@ def _encoder_works(ffmpeg: str, encoder: str, resolution: str) -> tuple[bool, st
 def _command_status(
     command: object, default: Path | None = None, base: Path = ROOT
 ) -> dict[str, object]:
-    configured = command[0] if isinstance(command, list) and command else command
+    parts = list(command) if isinstance(command, list) else shlex.split(str(command or ""))
+    configured = parts[0] if parts else None
     executable = str(configured or default or "")
     if not executable:
         return {"available": False, "command": ""}
@@ -104,14 +106,86 @@ def _command_status(
     return {"available": bool(resolved), "command": resolved or executable}
 
 
+def normalize_command(command: object, base: Path = ROOT) -> list[str]:
+    parts = list(command) if isinstance(command, list) else shlex.split(str(command or ""))
+    if not parts:
+        return []
+    executable = Path(parts[0])
+    local = executable if executable.is_absolute() else base / executable
+    resolved = str(local.resolve()) if local.exists() else shutil.which(parts[0])
+    if resolved:
+        parts[0] = resolved
+    return parts
+
+
+def command_identity(command: object, base: Path = ROOT) -> dict:
+    parts = normalize_command(command, base)
+    files = {}
+    for index, part in enumerate(parts):
+        if "{" in part:
+            continue
+        candidate = Path(part)
+        if not candidate.is_absolute():
+            candidate = base / candidate
+        if candidate.is_file():
+            files[str(index)] = {
+                "size": candidate.stat().st_size,
+                "sha256": file_sha256(candidate),
+            }
+    return {"command": parts, "files": files}
+
+
+def parse_detection_coordinates(encoded: str, minimum_height: float = 0.12) -> list[tuple[float, ...]]:
+    boxes = [tuple(map(float, item.split(","))) for item in encoded.split(";") if item]
+    return [box for box in boxes if len(box) == 4 and box[3] >= minimum_height]
+
+
+def detector_qualification(project: dict, command: object) -> dict[str, object]:
+    configured = project.get("privacy_detector_command", project.get("people_detector"))
+    if not configured and platform.system() == "Darwin":
+        return {"qualified": True, "source": "apple-vision-default"}
+    value = project.get("privacy_detector_qualification")
+    if not value:
+        return {"qualified": False, "reason": "missing privacy_detector_qualification"}
+    path = resolve_project_path(project, str(value))
+    try:
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return {"qualified": False, "reason": f"invalid qualification artifact: {error}"}
+    metrics = artifact.get("metrics", {})
+    try:
+        qualified = bool(
+            artifact.get("version") == 1
+            and artifact.get("parser_policy") == "minimum-height-0.12-v1"
+            and artifact.get("detector")
+            == command_identity(command, Path(project.get("_project_dir", ROOT)))
+            and artifact.get("labels_sha256")
+            and artifact.get("inputs_sha256")
+            and artifact.get("detections_sha256")
+            and float(metrics.get("any_person_recall", 0)) >= 0.99
+            and float(metrics.get("overlap_recall", 0)) >= 0.90
+        )
+    except (TypeError, ValueError):
+        qualified = False
+    return {
+        "qualified": qualified,
+        "source": str(path),
+        "reason": "" if qualified else "qualification does not match detector or recall contract",
+    }
+
+
 def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
     project_dir = Path(project.get("_project_dir", ROOT))
     output = project_dir / "build/host-capabilities.json"
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
         raise SystemExit("ffmpeg is unavailable")
+    system = platform.system()
+    default_people = ROOT / "scripts/vision-people.swift" if system == "Darwin" else None
+    detector_command = project.get("privacy_detector_command", project.get("people_detector"))
+    qualification = optional_project_path(project, "privacy_detector_qualification")
     signature = {
-        "system": platform.system(),
+        "system": system,
         "machine": platform.machine(),
         "ffmpeg": ffmpeg,
         "ffmpeg_version": _ffmpeg_version(ffmpeg),
@@ -120,6 +194,11 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
         "final_resolution": str(project.get("final_resolution", "3840x2160")),
         "privacy_detector_command": project.get(
             "privacy_detector_command", project.get("people_detector")
+        ),
+        "privacy_detector_qualification": project.get("privacy_detector_qualification"),
+        "privacy_detector_identity": command_identity(detector_command or default_people, project_dir),
+        "privacy_detector_qualification_identity": (
+            content_fingerprint(qualification) if qualification and qualification.exists() else None
         ),
         "ocr_command": project.get("ocr_command"),
     }
@@ -131,6 +210,13 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
     if policy not in {"auto", "off", "required"}:
         raise SystemExit("acceleration must be auto, off, or required")
     requested = signature["requested_encoder"]
+    hardware_encoders = {
+        encoder
+        for system in ("Darwin", "Linux", "Windows")
+        for encoder in encoder_candidates(system)
+    }
+    if policy == "off" and requested in hardware_encoders:
+        raise SystemExit("hardware acceleration is disabled but a hardware encoder was requested")
     resolution = signature["final_resolution"]
     if resolution not in {"1920x1080", "3840x2160"}:
         raise SystemExit("final_resolution must be 1920x1080 or 3840x2160")
@@ -149,23 +235,20 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
             break
     if not selected:
         raise SystemExit(f"no usable FFmpeg H.264 encoder found: {', '.join(candidates)}")
-    hardware = selected != "libx264"
+    hardware = selected in hardware_encoders
     if policy == "required" and not hardware:
         raise SystemExit("hardware acceleration is required but no supported encoder passed its smoke test")
     if requested != "auto" and selected != requested:
         raise SystemExit(f"requested encoder is unavailable: {requested}")
 
-    default_people = ROOT / "scripts/vision-people.swift" if signature["system"] == "Darwin" else None
     default_ocr = ROOT / "scripts/vision-ocr.swift" if signature["system"] == "Darwin" else None
+    detector_status = _command_status(detector_command, default_people, project_dir)
+    detector_status.update(detector_qualification(project, detector_command or default_people))
     profile = {
         "version": 1,
         "signature": signature,
         "video_encoder": {"name": selected, "hardware": hardware, "probes": probes},
-        "privacy_detector": _command_status(
-            project.get("privacy_detector_command", project.get("people_detector")),
-            default_people,
-            project_dir,
-        ),
+        "privacy_detector": detector_status,
         "ocr": _command_status(project.get("ocr_command"), default_ocr, project_dir),
     }
     atomic_write_json(output, profile)
@@ -174,8 +257,6 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
 
 
 def privacy_detector_command(project: dict) -> list[str]:
-    import shlex
-
     configured = project.get("privacy_detector_command", project.get("people_detector"))
     if configured:
         command = list(configured) if isinstance(configured, list) else shlex.split(str(configured))
@@ -196,6 +277,9 @@ def privacy_detector_command(project: dict) -> list[str]:
         command[0] = str(local.resolve())
     elif not shutil.which(command[0]):
         raise SystemExit(f"privacy detector is unavailable: {command[0]}")
+    qualification = detector_qualification(project, command)
+    if not qualification["qualified"]:
+        raise SystemExit(f"privacy detector is not qualified: {qualification['reason']}")
     return command
 
 
@@ -211,6 +295,18 @@ def project_path(project: dict, key: str) -> Path:
 def optional_project_path(project: dict, key: str) -> Path | None:
     value = project.get(key)
     return resolve_project_path(project, value) if value else None
+
+
+def ensure_slides_text(project: dict) -> Path:
+    slides_text = project_path(project, "slides_text")
+    if slides_text.exists():
+        return slides_text
+    slides_pdf = optional_project_path(project, "slides_pdf")
+    if not slides_pdf or not slides_pdf.exists():
+        raise SystemExit("slides_text is missing; extract it from the supplied screen recording")
+    slides_text.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["pdftotext", "-layout", str(slides_pdf), str(slides_text)], check=True)
+    return slides_text
 
 
 def atomic_write_text(path: Path, content: str) -> None:
@@ -250,7 +346,7 @@ def content_fingerprint(path: Path, cache: Path | None = None) -> dict:
         except (OSError, json.JSONDecodeError):
             pass
     key = {"path": str(path.resolve()), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
-    digest = cached.get("sha256") if cached and all(cached.get(k) == v for k, v in key.items()) else file_sha256(path)
+    digest = file_sha256(path)
     if cache and (not cached or cached.get("sha256") != digest or any(cached.get(k) != v for k, v in key.items())):
         atomic_write_json(cache, {**key, "sha256": digest})
     return {"size": stat.st_size, "sha256": digest}
@@ -283,6 +379,17 @@ def source_to_output(
         if presentation_start <= float(entry["source_start"]) <= source_time
     )
     return max(0.0, source_time - presentation_start - removed + inserted)
+
+
+def presentation_bounds(project: dict, source_duration: float) -> tuple[float, float]:
+    start = float(project.get("presentation_start", 0))
+    configured_end = project.get("presentation_end")
+    end = source_duration if configured_end is None else float(configured_end)
+    if not 0 <= start < end <= source_duration + 1 / 30:
+        raise SystemExit(
+            f"invalid presentation range {start:.3f}-{end:.3f} for {source_duration:.3f}s source"
+        )
+    return start, min(end, source_duration)
 
 
 def source_range_output_duration(
