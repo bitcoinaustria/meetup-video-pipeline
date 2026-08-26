@@ -845,12 +845,7 @@ def main() -> None:
     subparsers.add_parser("release")
     args = parser.parse_args()
     if args.command == "init":
-        event_url = args.event_url
-        if event_url is None and sys.stdin.isatty():
-            event_url = input(
-                "Meetup announcement URL (Meetup, Luma, or website; optional): "
-            ).strip()
-        init_project(args.project, args.name, event_url or "")
+        init_project(args.project, args.name, args.event_url or "")
         return
     project = load_project(args.project)
 

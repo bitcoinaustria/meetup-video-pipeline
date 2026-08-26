@@ -24,26 +24,39 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 ```
 
-## Start a project
+## Agent-first workflow
 
-```sh
-make init NAME=my-talk EVENT_URL=https://example.com/events/my-talk
-cp /path/to/recording.mp4 projects/my-talk/source/video.mp4
-cp /path/to/slides.pdf projects/my-talk/source/slides.pdf
+Put the recording, slide PDF, and any supporting files in an event folder, for example:
+
+```text
+projects/my-talk/source/
+├── recording.mp4
+└── slides.pdf
 ```
 
-When run interactively without `EVENT_URL`, initialization asks for an optional Meetup,
-Luma, or event-website announcement URL. The invoking agent reads that page and records a
-factual snapshot in `event_context`; render scripts never browse independently. Edit
-`projects/my-talk/project.json`: title, speaker first name, presentation start, technical
-transcription terms, source geometry, and project-local artifact paths. Paths in a manifest
-resolve relative to that manifest, so the complete `projects/my-talk/` directory can be
+Then ask a production agent to handle that folder. No filenames, manifest, or `make`
+commands are required from the user. An announcement link can be included immediately:
+
+> Produce the meetup video from `projects/my-talk/source`. Event information:
+> `https://example.com/events/my-talk`
+
+The agent inventories the files, creates or completes the project manifest, and uses the
+announcement page for the event title, speaker, abstract, terminology, date, venue, and
+organizer context. If no Meetup, Luma, or website link was supplied in the request, manifest,
+or supporting files, the agent asks for one; the user can confirm that no page exists. The
+agent captures supported facts in `event_context`, selects its own analyzer adapter, runs the
+pipeline gates, requests preview approval, and reports the finished artifacts. Render scripts
+never browse independently.
+
+Paths in a manifest resolve relative to that manifest, so a complete project folder can be
 archived to shared storage and restored on another checkout.
 
 The initial camera/slide calibration produces the timeline, slide images, speaker track, and two privacy masks referenced by the manifest. These physical-camera values stay project-specific; the render and edit pipeline never assumes one event's crop or speaker position applies to another. See the [agent production runbook](.agents/skills/meetup-video-production/SKILL.md) for the exact gates and artifact contract.
 
-## Reproducible workflow
+## Pipeline contract
 
+The production agent uses these commands as a reproducible internal interface. They remain
+available to maintainers for debugging and automation; ordinary users should not need them.
 Every command accepts the same manifest through `PROJECT`:
 
 ```sh
@@ -58,8 +71,8 @@ make chapters PROJECT=projects/my-talk/project.json
 make validate PROJECT=projects/my-talk/project.json
 ```
 
-The manifest's `analyzer` selects the default agent for every semantic stage. The invoking
-agent can select or override it for a run with `ANALYZER=codex` (or `claude`); optional
+The manifest's `analyzer` selects the default agent for every semantic stage. The production
+agent selects or overrides it with `ANALYZER=codex` (or `claude`); optional
 `audio_analyzer`, `faq_analyzer`, and `publishing_analyzer` settings override individual
 stages. The generator has no vendor-specific default.
 
