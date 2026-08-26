@@ -494,9 +494,9 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
     source_audio = next(
         (stream for stream in source_probe["streams"] if stream["codec_type"] == "audio"), None
     )
-    if not source_audio or int(source_audio.get("channels", 0)) != 2:
+    if not source_audio or int(source_audio.get("channels", 0)) not in {1, 2}:
         channels = source_audio.get("channels", "missing") if source_audio else "missing"
-        raise SystemExit(f"source video must contain two audio channels; found {channels}")
+        raise SystemExit(f"source video must contain mono or stereo audio; found {channels} channels")
     final_edits = json.loads(project_path(project, "edl").read_text(encoding="utf-8")).get("edits", [])
 
     def represented(candidate: dict) -> bool:
@@ -608,6 +608,17 @@ def render(
         audio_policy = json.loads(audio_edits.read_text(encoding="utf-8")).get(
             "channel_analysis", {}
         ).get("render_policy", audio_policy)
+    else:
+        source_audio = next(
+            (
+                stream
+                for stream in probe_media(project_path(project, "video"))["streams"]
+                if stream["codec_type"] == "audio"
+            ),
+            None,
+        )
+        if source_audio and int(source_audio.get("channels", 0)) == 1:
+            audio_policy = "process_once_then_duplicate_to_stereo"
     encoder = host_capabilities(project)["video_encoder"]["name"]
     preset = project.get("final_preset" if final else "preview_preset", "ultrafast")
     command = [
@@ -933,9 +944,16 @@ def main() -> None:
         render_shorts(project, args.project)
     elif args.command == "validate":
         target = args.input or project_path(project, "final_output")
-        resolution = args.resolution or project.get("final_resolution", "3840x2160")
-        validate_render(target, resolution, expected_render_duration(project))
-        validate_privacy_render(target, project, resolution)
+        resolution = args.resolution or (
+            "1920x1080" if args.input else project.get("final_resolution", "3840x2160")
+        )
+        validate_render(
+            target,
+            resolution,
+            None if args.input else expected_render_duration(project),
+        )
+        if not args.input:
+            validate_privacy_render(target, project, resolution)
     else:
         if project.get("rebuild_analysis_before_final", True):
             build_audio(project, args.project, args.analyzer)

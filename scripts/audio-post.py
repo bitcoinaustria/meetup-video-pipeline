@@ -222,7 +222,7 @@ def analyze_channels(wav_path: Path) -> dict:
     if channels == 1:
         classification = "mono"
         analysis_channels = [1]
-        render_policy = "preserve_mono"
+        render_policy = "process_once_then_duplicate_to_stereo"
     elif dual_mono:
         classification = "dual_mono"
         analysis_channels = [1]
@@ -2059,6 +2059,13 @@ def self_test() -> None:
                 audio.writeframes(samples.tobytes())
             expected = "independent_channels" if independent else "dual_mono"
             assert analyze_channels(path)["classification"] == expected
+        mono = Path(directory) / "mono.wav"
+        with wave.open(str(mono), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(array.array("h", [1000] * 16000).tobytes())
+        assert analyze_channels(mono)["render_policy"] == "process_once_then_duplicate_to_stereo"
     print("audio-post self-test: ok")
 
 

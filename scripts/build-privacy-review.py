@@ -383,7 +383,7 @@ def main() -> None:
         resolve_project_path(project, timeline["speaker_track"]),
         replacements,
         int(timeline["speaker_crop"]["width"]),
-        int(timeline.get("source_width", timeline["screen_crop"]["width"])),
+        int(timeline.get("source_width", 3840)),
         track,
     )
     timeline["speaker_track"] = str(track)

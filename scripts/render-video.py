@@ -241,7 +241,6 @@ def main() -> None:
     parser.add_argument(
         "--audio-policy",
         choices=(
-            "preserve_mono",
             "process_once_then_duplicate_to_stereo",
             "process_and_preserve_each_channel_separately",
         ),

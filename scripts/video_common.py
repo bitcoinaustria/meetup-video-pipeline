@@ -60,7 +60,7 @@ def _ffmpeg_version(ffmpeg: str) -> str:
     return result.stdout.splitlines()[0]
 
 
-def _encoder_works(ffmpeg: str, encoder: str) -> tuple[bool, str]:
+def _encoder_works(ffmpeg: str, encoder: str, resolution: str) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             [
@@ -71,7 +71,7 @@ def _encoder_works(ffmpeg: str, encoder: str) -> tuple[bool, str]:
                 "-f",
                 "lavfi",
                 "-i",
-                "color=c=black:s=128x72:r=1:d=1",
+                f"color=c=black:s={resolution}:r=1:d=1",
                 "-frames:v",
                 "1",
                 "-an",
@@ -117,6 +117,7 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
         "ffmpeg_version": _ffmpeg_version(ffmpeg),
         "acceleration": str(project.get("acceleration", "auto")),
         "requested_encoder": str(project.get("encoder", "auto")),
+        "final_resolution": str(project.get("final_resolution", "3840x2160")),
         "privacy_detector_command": project.get(
             "privacy_detector_command", project.get("people_detector")
         ),
@@ -130,6 +131,9 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
     if policy not in {"auto", "off", "required"}:
         raise SystemExit("acceleration must be auto, off, or required")
     requested = signature["requested_encoder"]
+    resolution = signature["final_resolution"]
+    if resolution not in {"1920x1080", "3840x2160"}:
+        raise SystemExit("final_resolution must be 1920x1080 or 3840x2160")
     candidates = (
         [requested]
         if requested != "auto"
@@ -138,7 +142,7 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
     probes = []
     selected = None
     for encoder in candidates:
-        works, detail = _encoder_works(ffmpeg, encoder)
+        works, detail = _encoder_works(ffmpeg, encoder, resolution)
         probes.append({"encoder": encoder, "available": works, "detail": detail})
         if works:
             selected = encoder

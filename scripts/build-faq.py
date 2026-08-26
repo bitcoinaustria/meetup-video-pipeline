@@ -452,7 +452,7 @@ audience contribution. answer_start/answer_end are exact source-video seconds fo
 comments may point to the next presenter answer. Never invent a topic absent from transcript and slides. Prefer recall
 over silently leaving audience audio in.
 """.strip()
-    return run_structured_model(provider, analysis_schema(), prompt)
+    return run_structured_model(provider, analysis_schema(), prompt, timeout=900)
 
 
 def analysis_chunks(

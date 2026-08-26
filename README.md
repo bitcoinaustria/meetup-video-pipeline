@@ -122,7 +122,7 @@ Source media remains in the project's `source/` directory. Intermediate assets b
 
 - One source-time EDL drives audio, video, tracking, slides, FAQ insertion, chapters, and Shorts.
 - Multi-pass speech editing cuts only when deterministic, acoustic, speaker-context, and semantic checks agree.
-- Two-channel input is inspected before processing because stereo can contain two independent mono microphones.
+- Mono input is duplicated to the required stereo output. Stereo input is inspected before processing because its channels can contain two independent mono microphones.
 - Ambiguous speaker identity or overlapping people trigger full-camera blur; privacy fails closed.
 - Camera timestamps remain the render clock, preventing duplicate catch-up frames around hard cuts.
 - Source media is immutable. Caches live in `build/` and `tmp/`; release artifacts live in categorized `output/` subdirectories.

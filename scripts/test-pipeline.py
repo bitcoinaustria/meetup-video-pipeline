@@ -219,6 +219,12 @@ def main() -> None:
         command = [sys.executable, str(ROOT / "scripts/meetup-video.py"), "--project", str(project)]
         run(*command, "check")
         run(*command, "preview", "--duration", str(DURATION))
+        run(
+            *command,
+            "validate",
+            "--input",
+            str(project.parent / "output/debug/previews/preview-1080p.mp4"),
+        )
         edl = project.parent / "final-edits.json"
         approved_edl = edl.read_bytes()
         edl.write_bytes(approved_edl + b" ")
