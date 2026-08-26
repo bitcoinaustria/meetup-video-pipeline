@@ -35,6 +35,7 @@ CHUNK_SECONDS = 1_200.0
 CHUNK_CONTEXT_SECONDS = 90.0
 MAX_ANALYSIS_WORKERS = 3
 WHISPER_THREADS = max(1, os.cpu_count() or 1)
+LEGACY_MACOS_FAQ_FONT = Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf")
 
 
 def run(command: list[str], *, capture: bool = False) -> str:
@@ -57,6 +58,12 @@ def project_slug(project: dict, project_file: Path) -> str:
     raw = str(project.get("name", project_file.stem))
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw).strip("-.")
     return slug or "presentation"
+
+
+def faq_label(project: dict) -> str:
+    if "faq_label" in project:
+        return str(project["faq_label"])
+    return "FRAGE AUS DEM PUBLIKUM" if str(project.get("language", "de")).lower().startswith("de") else "AUDIENCE QUESTION"
 
 
 def review_identity(
@@ -714,13 +721,16 @@ def write_outputs(
                 "--background",
                 str(resolve_project_path(project, project["background"])),
                 "--label",
-                str(project.get("faq_label", "AUDIENCE QUESTION")),
+                faq_label(project),
                 "--accent",
                 str(project.get("faq_accent", "#eb0028")),
             ]
-            if project.get("faq_font"):
+            faq_font = project.get("faq_font")
+            if not faq_font and "faq_label" not in project and LEGACY_MACOS_FAQ_FONT.exists():
+                faq_font = str(LEGACY_MACOS_FAQ_FONT)
+            if faq_font:
                 card_command.extend(
-                    ["--font", str(resolve_project_path(project, project["faq_font"]))]
+                    ["--font", str(resolve_project_path(project, str(faq_font)))]
                 )
             run(card_command)
             faq_entries.append(
@@ -941,6 +951,9 @@ def main() -> None:
 
 
 def self_test() -> None:
+    assert faq_label({"language": "de"}) == "FRAGE AUS DEM PUBLIKUM"
+    assert faq_label({"language": "en"}) == "AUDIENCE QUESTION"
+    assert faq_label({"language": "de", "faq_label": "Q&A"}) == "Q&A"
     assert legacy_review_identity_matches(
         {"video_path": "source.mp4", "video_size": 10, "video_mtime_ns": 1},
         {
