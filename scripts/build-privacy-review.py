@@ -6,12 +6,23 @@ import math
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 
 from PIL import Image, ImageDraw, ImageStat
+
+from video_common import (
+    atomic_write_json,
+    atomic_write_text,
+    ffconcat_quote,
+    host_capabilities,
+    parse_detection_coordinates,
+    privacy_detector_command,
+    resolve_project_path,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -44,11 +55,7 @@ def run(command: list[str]) -> None:
 
 
 def parse_boxes(encoded: str) -> list[Box]:
-    boxes = []
-    for item in encoded.split(";"):
-        if item:
-            boxes.append(Box(*map(float, item.split(","))))
-    return [box for box in boxes if box.height >= 0.12]
+    return [Box(*coordinates) for coordinates in parse_detection_coordinates(encoded)]
 
 
 def read_detections(path: Path) -> list[tuple[float, list[Box]]]:
@@ -61,7 +68,7 @@ def read_detections(path: Path) -> list[tuple[float, list[Box]]]:
 
 def privacy_action(speaker: Box | None, others: list[Box], margin: float = 0.035) -> str:
     if speaker is None:
-        return "full-blur" if others else "blur-others"
+        return "full-blur"
     for other in others:
         horizontal_gap = max(0.0, max(speaker.x, other.x) - min(speaker.x + speaker.width, other.x + other.width))
         vertical_overlap = min(speaker.y + speaker.height, other.y + other.height) - max(speaker.y, other.y)
@@ -161,6 +168,8 @@ def speaker_reference(detections: Path, samples: Path) -> tuple[float, float]:
         for row in rows
         if (samples / f"frame-{round(row[0]) + 1:05d}.jpg").exists()
     ]
+    if not pairs:
+        raise SystemExit("privacy review has no usable single-person reference samples")
     selected_rows = [row for row, _frame in pairs]
     add_appearance([frame for _row, frame in pairs], selected_rows)
     return (
@@ -218,18 +227,29 @@ def make_mask(
     output = window_dir / "mask.mp4"
     cut_output = window_dir / "full-blur.mp4"
     for source, target in ((masks, output), (cuts, cut_output)):
-        run([
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-            "-framerate", str(MASK_FPS), "-i", str(source / "frame-%05d.png"),
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-pix_fmt", "yuv420p",
-            str(target),
-        ])
+        temporary = target.with_name(f".{target.stem}.tmp{target.suffix}")
+        try:
+            run([
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                "-framerate", str(MASK_FPS), "-i", str(source / "frame-%05d.png"),
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-pix_fmt", "yuv420p",
+                str(temporary),
+            ])
+            temporary.replace(target)
+        finally:
+            temporary.unlink(missing_ok=True)
     shutil.rmtree(masks)
     shutil.rmtree(cuts)
     return output, cut_output
 
 
-def extract_and_detect(video: Path, window_dir: Path, start: float, duration: float) -> list[tuple[float, list[Box]]]:
+def extract_and_detect(
+    video: Path,
+    window_dir: Path,
+    start: float,
+    duration: float,
+    detector_command: list[str],
+) -> list[tuple[float, list[Box]]]:
     frames = window_dir / "frames"
     frames.mkdir(parents=True)
     run([
@@ -239,12 +259,12 @@ def extract_and_detect(video: Path, window_dir: Path, start: float, duration: fl
     ])
     frame_paths = sorted(frames.glob("frame-*.jpg"))
     inputs = window_dir / "inputs.tsv"
-    inputs.write_text(
+    atomic_write_text(
+        inputs,
         "".join(f"{index / DETECT_FPS:.3f}\t{path}\n" for index, path in enumerate(frame_paths)),
-        encoding="utf-8",
     )
     results = window_dir / "detections.tsv"
-    run([str(ROOT / "scripts/vision-people.swift"), "--list", str(inputs), "--output", str(results)])
+    run([part.format(inputs=inputs, output=results) for part in detector_command])
     detections = read_detections(results)
     add_appearance(frame_paths, detections)
     shutil.rmtree(frames)
@@ -255,6 +275,7 @@ def corrected_track(
     base_track: Path,
     replacements: list[tuple[float, list[tuple[float, Box | None]]]],
     crop_width: int,
+    source_width: int,
     output: Path,
 ) -> None:
     track = json.loads(base_track.read_text(encoding="utf-8"))
@@ -271,8 +292,11 @@ def corrected_track(
             ]
             if nearby:
                 center = sum(nearby) / len(nearby)
-                item["x"] = round(max(0, min(3840 - crop_width, center * 3840 - crop_width / 2)), 2)
-    output.write_text(json.dumps(track, indent=2) + "\n", encoding="utf-8")
+                item["x"] = round(
+                    max(0, min(source_width - crop_width, center * source_width - crop_width / 2)),
+                    2,
+                )
+    atomic_write_json(output, track)
 
 
 def format_time(seconds: float) -> str:
@@ -283,32 +307,68 @@ def format_time(seconds: float) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render only multi-person privacy review passages.")
-    parser.add_argument("--video", type=Path, required=True)
-    parser.add_argument("--coarse-detections", type=Path, default=ROOT / "tmp/people-results-upper-1s.tsv")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=ROOT / "output/debug/privacy/problemstellen-privacy-test-1080p.mp4",
-    )
+    parser.add_argument("--project", type=Path)
+    parser.add_argument("--video", type=Path)
+    parser.add_argument("--coarse-detections", type=Path)
+    parser.add_argument("--samples", type=Path)
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--padding", type=float, default=1.25)
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
 
-    timeline = json.loads((ROOT / "timeline.json").read_text(encoding="utf-8"))
+    project = {}
+    if args.project:
+        project = json.loads(args.project.read_text(encoding="utf-8"))
+        project["_project_dir"] = str(args.project.resolve().parent)
+    base = Path(project.get("_project_dir", ROOT))
+    args.video = args.video or (
+        resolve_project_path(project, project["video"]) if project.get("video") else None
+    )
+    if not args.video:
+        raise SystemExit("--video or a project with video is required")
+    args.coarse_detections = args.coarse_detections or resolve_project_path(
+        project, project.get("coarse_detections", "tmp/people-results-upper-1s.tsv")
+    )
+    args.samples = args.samples or resolve_project_path(
+        project, project.get("coarse_detection_samples", "tmp/people-samples-1s")
+    )
+    args.output = args.output or resolve_project_path(
+        project,
+        project.get(
+            "privacy_review_output",
+            "output/debug/privacy/problemstellen-privacy-test-1080p.mp4",
+        ),
+    )
+    detector_command = privacy_detector_command(project)
+    detector_path = Path(detector_command[0])
+    if not detector_path.is_absolute() and (base / detector_path).exists():
+        detector_command[0] = str((base / detector_path).resolve())
+
+    timeline_path = resolve_project_path(project, project.get("timeline", "timeline.json"))
+    timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
     windows = problem_windows(args.coarse_detections, float(timeline["duration"]), args.padding)
-    reference = speaker_reference(args.coarse_detections, ROOT / "tmp/people-samples-1s")
-    build = ROOT / "build/privacy-review"
+    if not windows:
+        raise SystemExit("no multi-person privacy windows found")
+    reference = speaker_reference(args.coarse_detections, args.samples)
+    build = base / "build/privacy-review"
     build.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
     replacements: list[tuple[float, list[tuple[float, Box | None]]]] = []
     masks: list[Path] = []
     cuts: list[Path] = []
+    encoder = host_capabilities(project)["video_encoder"]["name"]
 
     for index, (start, end) in enumerate(windows, 1):
         window_dir = build / f"window-{index:02d}"
         if window_dir.exists():
             shutil.rmtree(window_dir)
         window_dir.mkdir(parents=True)
-        detections = extract_and_detect(args.video, window_dir, start, end - start)
+        detections = extract_and_detect(
+            args.video, window_dir, start, end - start, detector_command
+        )
         speakers, others = speaker_and_others(detections, reference)
         mask, cut = make_mask(window_dir, end - start, speakers, others)
         masks.append(mask)
@@ -316,25 +376,39 @@ def main() -> None:
         replacements.append((start, [(time, box) for (time, _boxes), box in zip(detections, speakers, strict=True)]))
 
     track = build / "speaker-track.json"
-    corrected_track(ROOT / timeline["speaker_track"], replacements, int(timeline["speaker_crop"]["width"]), track)
+    corrected_track(
+        resolve_project_path(project, timeline["speaker_track"]),
+        replacements,
+        int(timeline["speaker_crop"]["width"]),
+        int(timeline.get("source_width", 3840)),
+        track,
+    )
     timeline["speaker_track"] = str(track)
     review_timeline = build / "timeline.json"
-    review_timeline.write_text(json.dumps(timeline, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(review_timeline, timeline)
 
     for index, ((start, end), mask, cut) in enumerate(zip(windows, masks, cuts, strict=True), 1):
         clip = build / f"clip-{index:02d}.mp4"
-        run([
-            "python3", str(ROOT / "scripts/render-video.py"), "--video", str(args.video),
+        command = [
+            sys.executable, str(ROOT / "scripts/render-video.py"), "--video", str(args.video),
+            "--project-dir", str(base),
             "--timeline", str(review_timeline), "--start", f"{start:.3f}", "--duration", f"{end - start:.3f}",
-            "--privacy-mask", str(mask), "--resolution", "1920x1080", "--encoder", "libx264",
-            "--full-blur-mask", str(cut),
+            "--privacy-mask", str(mask), "--resolution", "1920x1080", "--encoder", encoder,
+            "--full-blur-mask", str(cut), "--privacy-mask-start", f"{start:.3f}",
             "--preset", "ultrafast", "--output", str(clip),
-        ])
+        ]
+        if project.get("background"):
+            command.extend(("--background", str(resolve_project_path(project, project["background"]))))
+        if project.get("slides"):
+            command.extend(("--slides", str(resolve_project_path(project, project["slides"]))))
+        run(command)
         clips.append(clip)
 
     concat = build / "clips.ffconcat"
-    concat.write_text(
-        "ffconcat version 1.0\n" + "".join(f"file '{clip}'\n" for clip in clips), encoding="utf-8"
+    atomic_write_text(
+        concat,
+        "ffconcat version 1.0\n"
+        + "".join(f"file {ffconcat_quote(clip.resolve())}\n" for clip in clips),
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     run([
@@ -346,6 +420,10 @@ def main() -> None:
         print(f"{format_time(start)}-{format_time(end)}")
 
 
-if __name__ == "__main__":
+def self_test() -> None:
     assert parse_boxes("0,0,1,1")[0].center == 0.5
+    assert privacy_action(None, []) == "full-blur"
+
+
+if __name__ == "__main__":
     main()

@@ -8,6 +8,7 @@ This file contains only the repo-specific rules for changing the generator. Read
 - Run `python3 -m py_compile scripts/*.py` after Python changes.
 - Render a short 1080p passage before any full production run; full renders are slow and consume substantial disk space.
 - Validate the final artifact with `make validate` before calling it complete.
+- Run `make test` before shipping generator changes.
 
 Privacy is fail-closed: ambiguous speaker identity or overlapping people must blur the complete camera panel. Never weaken this fallback to improve aesthetics.
 

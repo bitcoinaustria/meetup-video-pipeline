@@ -1,2 +1,2 @@
 numpy
-Pillow
+Pillow>=10.1

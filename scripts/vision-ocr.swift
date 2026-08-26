@@ -3,15 +3,21 @@
 import Foundation
 import Vision
 
-guard CommandLine.arguments.count == 5,
-      CommandLine.arguments[1] == "--list",
-      CommandLine.arguments[3] == "--output" else {
-    fputs("usage: vision-ocr.swift --list INPUT.tsv --output OUTPUT.tsv\n", stderr)
+var arguments = Array(CommandLine.arguments.dropFirst())
+var language = "en-US"
+if let index = arguments.firstIndex(of: "--language"), index + 1 < arguments.count {
+    language = arguments[index + 1]
+    arguments.removeSubrange(index...(index + 1))
+}
+guard arguments.count == 4,
+      arguments[0] == "--list",
+      arguments[2] == "--output" else {
+    fputs("usage: vision-ocr.swift --list INPUT.tsv --output OUTPUT.tsv [--language LANGUAGE]\n", stderr)
     exit(2)
 }
 
-let inputURL = URL(fileURLWithPath: CommandLine.arguments[2])
-let outputURL = URL(fileURLWithPath: CommandLine.arguments[4])
+let inputURL = URL(fileURLWithPath: arguments[1])
+let outputURL = URL(fileURLWithPath: arguments[3])
 guard let input = try? String(contentsOf: inputURL, encoding: .utf8) else {
     fputs("cannot read \(inputURL.path)\n", stderr)
     exit(2)
@@ -24,7 +30,7 @@ for row in input.split(separator: "\n") {
     let path = fields[2]
     let request = VNRecognizeTextRequest()
     request.recognitionLevel = .fast
-    request.recognitionLanguages = ["en-US"]
+    request.recognitionLanguages = [language]
     request.usesLanguageCorrection = true
 
     do {

@@ -17,6 +17,7 @@ separate_person = privacy.Box(0.70, 0.10, 0.15, 0.50)
 assert privacy.privacy_action(speaker, [overlapping_person]) == "full-blur"
 assert privacy.privacy_action(speaker, [separate_person]) == "blur-others"
 assert privacy.privacy_action(None, [separate_person]) == "full-blur"
+assert privacy.privacy_action(None, []) == "full-blur"
 
 anchor = privacy.Box(0.40, 0.20, 0.10, 0.40, 70, 38)
 twin_left = privacy.Box(0.35, 0.20, 0.10, 0.40, 70, 38)

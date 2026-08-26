@@ -6,13 +6,22 @@ import json
 import subprocess
 from pathlib import Path
 
+from video_common import (
+    atomic_write_text,
+    encoder_options,
+    ffconcat_quote,
+    monotone_slopes,
+    resolve_project_path,
+    source_to_output,
+    stabilize_camera_positions,
+)
+
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
 def project_source(path: str, project_dir: Path = ROOT) -> Path:
-    source = Path(path)
-    return (source if source.is_absolute() else project_dir / source).resolve()
+    return resolve_project_path({"_project_dir": str(project_dir)}, path).resolve()
 
 
 def load_edits(path: Path | None, video: Path, project_dir: Path = ROOT) -> list[dict]:
@@ -85,15 +94,15 @@ def kept_intervals(cuts: list[tuple[float, float]], duration: float) -> list[tup
     return kept
 
 
-def audio_edit_filter(cuts: list[tuple[float, float]], duration: float) -> str:
+def audio_edit_filter(source: str, cuts: list[tuple[float, float]], duration: float) -> str:
     kept = kept_intervals(cuts, duration)
 
     if len(kept) == 1:
         start, end = kept[0]
-        return f"[0:a:0]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[editeda]"
+        return f"[{source}]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS[editeda]"
 
     inputs = "".join(f"[audio{i}]" for i in range(len(kept)))
-    filters = [f"[0:a:0]asplit={len(kept)}{inputs};"]
+    filters = [f"[{source}]asplit={len(kept)}{inputs};"]
     for index, (start, end) in enumerate(kept):
         segment_duration = end - start
         fade = min(0.03, segment_duration / 3)
@@ -132,46 +141,6 @@ def video_edit_filter(label: str, cuts: list[tuple[float, float]], duration: flo
     return "".join(filters)
 
 
-def stabilize_camera_positions(
-    values: list[float], deadband: float = 80.0
-) -> list[float]:
-    """Keep a quiet dead zone while immediately following sustained travel."""
-    if not values:
-        return []
-    targets = values[:]
-    for index in range(1, len(values) - 1):
-        neighbors = (values[index - 1] + values[index + 1]) / 2
-        if abs(values[index] - neighbors) > 180 and abs(values[index - 1] - values[index + 1]) < 120:
-            targets[index] = neighbors
-    camera = targets[0]
-    held = [camera]
-    for target in targets[1:]:
-        if target > camera + deadband:
-            camera = target - deadband
-        elif target < camera - deadband:
-            camera = target + deadband
-        held.append(camera)
-    return held
-
-
-def monotone_slopes(times: list[float], values: list[float]) -> list[float]:
-    """C1-continuous slopes without overshoot between tracked positions."""
-    if len(values) < 2:
-        return [0.0] * len(values)
-    secants = [
-        (right - left) / (times[index + 1] - times[index])
-        for index, (left, right) in enumerate(zip(values, values[1:], strict=False))
-    ]
-    slopes = [secants[0]]
-    for left, right in zip(secants, secants[1:], strict=False):
-        if left * right <= 0:
-            slopes.append(0.0)
-        else:
-            slopes.append(2 * left * right / (left + right))
-    slopes.append(secants[-1])
-    return slopes
-
-
 def make_concat(timeline: dict, slides_dir: Path, output: Path) -> None:
     slides = timeline["slides"]
     duration = float(timeline["duration"])
@@ -182,9 +151,9 @@ def make_concat(timeline: dict, slides_dir: Path, output: Path) -> None:
         image = (slides_dir / f"page-{int(slide['page']):02d}.jpg").resolve()
         if seconds <= 0 or not image.exists():
             raise SystemExit(f"invalid slide segment: {slide}")
-        lines.extend((f"file '{image}'", f"duration {seconds:.6f}"))
-    lines.append(f"file '{image}'")
-    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        lines.extend((f"file {ffconcat_quote(image)}", f"duration {seconds:.6f}"))
+    lines.append(f"file {ffconcat_quote(image)}")
+    atomic_write_text(output, "\n".join(lines) + "\n")
 
 
 def make_speaker_commands(
@@ -242,13 +211,13 @@ def make_speaker_commands(
             f"{quadratic:.4f}*{delta}^2+{cubic:.4f}*{delta}^3"
         )
         commands.append(f"{local:.3f} crop@speaker x {expression};")
-    output.write_text("\n".join(commands) + "\n", encoding="utf-8")
+    atomic_write_text(output, "\n".join(commands) + "\n")
     return first
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Render a branded meetup presentation layout.")
-    parser.add_argument("--video", type=Path, required=True)
+    parser.add_argument("--video", type=Path)
     parser.add_argument("--project-dir", type=Path, default=ROOT)
     parser.add_argument("--timeline", type=Path, default=ROOT / "timeline.json")
     parser.add_argument("--background", type=Path, default=ROOT / "Background.png")
@@ -266,10 +235,31 @@ def main() -> None:
     parser.add_argument("--full-blur-mask", type=Path)
     parser.add_argument("--edl", type=Path, help="Approved automatic audio/video edits.")
     parser.add_argument("--faq-timeline", type=Path, help="Full-cover FAQ cards in source time.")
-    parser.add_argument("--encoder", default="h264_videotoolbox")
+    parser.add_argument("--encoder", default="libx264")
     parser.add_argument("--preset")
     parser.add_argument("--resolution", choices=("3840x2160", "1920x1080"), default="3840x2160")
+    parser.add_argument(
+        "--audio-policy",
+        choices=(
+            "process_once_then_duplicate_to_stereo",
+            "process_and_preserve_each_channel_separately",
+        ),
+        default="process_and_preserve_each_channel_separately",
+    )
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+    if args.self_test:
+        self_test()
+        return
+    if not args.video:
+        raise SystemExit("--video is required")
+    for name in (
+        "video", "project_dir", "timeline", "background", "slides", "output",
+        "privacy_mask", "full_blur_mask", "edl", "faq_timeline",
+    ):
+        value = getattr(args, name)
+        if value is not None:
+            setattr(args, name, value.resolve())
     if args.full_blur_mask and not args.privacy_mask:
         raise SystemExit("--full-blur-mask requires --privacy-mask")
     if args.privacy_mask and args.start < args.privacy_mask_start:
@@ -289,10 +279,17 @@ def main() -> None:
     person = timeline["speaker_crop"]
     screen = timeline["screen_crop"]
     output_width, output_height = map(int, args.resolution.split("x"))
-    scale = output_width / 3840
+    source_width = float(timeline.get("source_width", 3840))
+    if source_width <= 0:
+        raise SystemExit("timeline source_width must be positive")
+    layout_scale = output_width / 3840
+    source_scale = output_width / source_width
 
-    def scaled(value: int) -> int:
-        return round(value * scale)
+    def layout_scaled(value: int) -> int:
+        return round(value * layout_scale)
+
+    def source_scaled(value: int) -> int:
+        return round(value * source_scale)
 
     render_duration = args.duration if args.duration is not None else float(timeline["duration"]) - args.start
     edits = load_edits(args.edl, args.video, args.project_dir)
@@ -310,7 +307,7 @@ def main() -> None:
         commands,
         args.start,
         render_duration,
-        scale,
+        source_scale,
     )
     slide_offset = float(timeline["website_until"]) - args.start
     slide_enable = max(0.0, slide_offset)
@@ -345,43 +342,53 @@ def main() -> None:
     stage = (
         privacy
         + f"{source}split=3[person0][screen0][clock0];"
-        f"[person0]sendcmd=f={commands},crop@speaker={scaled(person['width'])}:{scaled(person['height'])}:{initial_x:.2f}:{scaled(person['y'])},"
-        f"scale={scaled(864)}:{scaled(1536)}:flags=lanczos[person];"
-        f"[screen0]crop={scaled(screen['width'])}:{scaled(screen['height'])}:{scaled(screen['x'])}:{scaled(screen['y'])},"
-        f"scale={scaled(2730)}:{scaled(1536)}:flags=lanczos[screen];"
+        f"[person0]sendcmd=f={commands.name},crop@speaker={source_scaled(person['width'])}:{source_scaled(person['height'])}:{initial_x:.2f}:{source_scaled(person['y'])},"
+        f"scale={layout_scaled(864)}:{layout_scaled(1536)}:flags=lanczos[person];"
+        f"[screen0]crop={source_scaled(screen['width'])}:{source_scaled(screen['height'])}:{source_scaled(screen['x'])}:{source_scaled(screen['y'])},"
+        f"scale={layout_scaled(2730)}:{layout_scaled(1536)}:flags=lanczos[screen];"
         f"[1:v]scale={output_width}:{output_height},format=yuv420p[background];"
         # Keep the camera's frame clock. A looped 30 fps background as the
         # overlay main duplicates frames when phone timestamps briefly drift.
         f"[clock0][background]blend=all_expr=B[canvas];"
-        f"[canvas][person]overlay={scaled(91)}:{scaled(296)}[stage1];"
-        f"[stage1][screen]overlay={scaled(1019)}:{scaled(296)}[stage2];"
+        f"[canvas][person]overlay={layout_scaled(91)}:{layout_scaled(296)}[stage1];"
+        f"[stage1][screen]overlay={layout_scaled(1019)}:{layout_scaled(296)}[stage2];"
     )
     slides_filter = (
-        f"[2:v]scale={scaled(2730)}:{scaled(1536)}:flags=lanczos,setpts=PTS+{slide_offset:.6f}/TB[slides];"
-        f"[stage2][slides]overlay={scaled(1019)}:{scaled(296)}:eof_action=pass:enable='gte(t,{slide_enable:.6f})'[outv]"
+        f"[2:v]scale={layout_scaled(2730)}:{layout_scaled(1536)}:flags=lanczos,setpts=PTS+{slide_offset:.6f}/TB[slides];"
+        f"[stage2][slides]overlay={layout_scaled(1019)}:{layout_scaled(296)}:eof_action=pass:enable='gte(t,{slide_enable:.6f})'[outv]"
     )
     filter_graph = stage + slides_filter
     video_label = "outv"
     audio_label: str | None = None
+    audio_source = "0:a:0"
+    if args.audio_policy == "process_once_then_duplicate_to_stereo":
+        filter_graph += ";[0:a:0]pan=mono|c0=c0,pan=stereo|c0=c0|c1=c0[prepareda]"
+        audio_source = "prepareda"
     if cuts:
         filter_graph += ";" + video_edit_filter(video_label, cuts, render_duration) + ";"
         video_label = "editedv0"
-        filter_graph += audio_edit_filter(cuts, render_duration)
+        filter_graph += audio_edit_filter(audio_source, cuts, render_duration)
         audio_label = "editeda"
     elif faq_entries:
         filter_graph += (
-            f";[0:a:0]atrim=start=0:end={render_duration:.6f},"
+            f";[{audio_source}]atrim=start=0:end={render_duration:.6f},"
             "asetpts=PTS-STARTPTS[editeda]"
         )
         audio_label = "editeda"
+    elif audio_source != "0:a:0":
+        audio_label = audio_source
 
     if faq_entries:
         assert audio_label is not None
+        filter_graph += f";[{audio_label}]aresample=48000,aformat=channel_layouts=stereo[faqbasea]"
+        audio_label = "faqbasea"
 
         def edited_time(source_timestamp: float) -> float:
-            local = source_timestamp - args.start
-            removed = sum(max(0.0, min(local, end) - start) for start, end in cuts if start < local)
-            return max(0.0, min(base_duration, local - removed))
+            local_edits = [
+                {"source_start": start + args.start, "source_end": end + args.start}
+                for start, end in cuts
+            ]
+            return min(base_duration, source_to_output(source_timestamp, args.start, local_edits))
 
         insertions = [(edited_time(entry["source_start"]), entry) for entry in faq_entries]
         intervals: list[tuple[float, float]] = []
@@ -451,14 +458,14 @@ def main() -> None:
     bitrate, maxrate, bufsize = ("8M", "12M", "16M") if output_width == 1920 else ("24M", "32M", "48M")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    command = ["ffmpeg", "-hide_banner", "-y"]
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
     if args.start:
         command.extend(("-ss", f"{args.start:.6f}"))
     command.extend((
         "-i", str(args.video),
         "-loop", "1", "-framerate", "30", "-i", str(args.background),
-        "-safe", "0", "-f", "concat", "-i", str(concat),
     ))
+    command.extend(("-safe", "0", "-f", "concat", "-i", str(concat)))
     if args.privacy_mask:
         mask_offset = args.start - args.privacy_mask_start
         if mask_offset:
@@ -473,28 +480,29 @@ def main() -> None:
     command.extend((
         "-filter_complex", filter_graph,
         "-map", video_map, "-map", audio_map,
-        "-c:v", args.encoder,
     ))
-    if args.encoder.endswith("_videotoolbox"):
-        command.extend(("-allow_sw", "1"))
+    command.extend(encoder_options(args.encoder, args.preset))
+    command.extend(("-enc_time_base:v", "1:30"))
     command.extend(("-b:v", bitrate, "-maxrate", maxrate, "-bufsize", bufsize))
-    if args.preset:
-        command.extend(("-preset", args.preset))
     command.extend((
         "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
-        "-c:a", "aac" if cuts or faq_entries else "copy",
+        "-c:a", "aac" if cuts or faq_entries or audio_label else "copy",
     ))
-    if cuts or faq_entries:
+    if cuts or faq_entries or audio_label:
         command.extend(("-b:a", "192k"))
     command.extend(("-movflags", "+faststart", "-t", f"{output_duration:.6f}"))
     command.append(str(args.output))
-    subprocess.run(command, check=True)
+    subprocess.run(command, check=True, cwd=build)
 
 
-if __name__ == "__main__":
+def self_test() -> None:
     assert stabilize_camera_positions([0, 0, 300, 0, 0]) == [0, 0, 0, 0, 0]
     followed = stabilize_camera_positions([0] * 4 + [400] * 10)
     assert max(abs(target - camera) for target, camera in zip([0] * 4 + [400] * 10, followed)) <= 80
     assert monotone_slopes([0, 1, 2], [0, 1, 0]) == [1.0, 0.0, -1.0]
     assert kept_intervals([(1.0, 2.0)], 3.0) == [(0.0, 1.0), (2.0, 3.0)]
+    print("render-video self-test: ok")
+
+
+if __name__ == "__main__":
     main()
