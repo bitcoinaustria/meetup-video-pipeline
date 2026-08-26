@@ -27,12 +27,18 @@ python3 -m venv .venv
 ## Start a project
 
 ```sh
-make init NAME=my-talk
+make init NAME=my-talk EVENT_URL=https://example.com/events/my-talk
 cp /path/to/recording.mp4 projects/my-talk/source/video.mp4
 cp /path/to/slides.pdf projects/my-talk/source/slides.pdf
 ```
 
-Edit `projects/my-talk/project.json`: title, speaker first name, presentation start, technical transcription terms, source geometry, and project-local artifact paths. Paths in a manifest resolve relative to that manifest, so the complete `projects/my-talk/` directory can be archived to shared storage and restored on another checkout.
+When run interactively without `EVENT_URL`, initialization asks for an optional Meetup,
+Luma, or event-website announcement URL. The invoking agent reads that page and records a
+factual snapshot in `event_context`; render scripts never browse independently. Edit
+`projects/my-talk/project.json`: title, speaker first name, presentation start, technical
+transcription terms, source geometry, and project-local artifact paths. Paths in a manifest
+resolve relative to that manifest, so the complete `projects/my-talk/` directory can be
+archived to shared storage and restored on another checkout.
 
 The initial camera/slide calibration produces the timeline, slide images, speaker track, and two privacy masks referenced by the manifest. These physical-camera values stay project-specific; the render and edit pipeline never assumes one event's crop or speaker position applies to another. See the [agent production runbook](.agents/skills/meetup-video-production/SKILL.md) for the exact gates and artifact contract.
 

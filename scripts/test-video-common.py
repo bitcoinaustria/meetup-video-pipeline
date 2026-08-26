@@ -8,6 +8,7 @@ from video_common import (
     build_time_map,
     configured_analyzer,
     content_fingerprint,
+    event_context,
     ffconcat_quote,
     source_range_output_duration,
     source_to_output,
@@ -36,6 +37,10 @@ except SystemExit as error:
     assert "no analyzer selected" in str(error)
 else:
     raise AssertionError("missing analyzer must fail closed")
+assert event_context({"event_url": " https://example.com/event ", "event_context": " Talk "}) == {
+    "announcement_url": "https://example.com/event",
+    "background": "Talk",
+}
 assert ffconcat_quote(Path("it's.mp4")) == "'it'\\''s.mp4'"
 assert list(
     whisper_tokens(

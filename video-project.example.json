@@ -1,6 +1,8 @@
 {
   "name": "presentation",
   "presentation_title": "Presentation title",
+  "event_url": "",
+  "event_context": "",
   "speaker": "First name",
   "organization": "Bitcoin Austria",
   "x_handle": "@bitcoin_at",

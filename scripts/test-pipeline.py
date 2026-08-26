@@ -167,7 +167,40 @@ def fixture(directory: Path) -> Path:
 def main() -> None:
     (ROOT / "build").mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="meetup-fixture-'", dir=ROOT / "build") as temporary:
-        project = fixture(Path(temporary))
+        temporary_path = Path(temporary)
+        initialized = temporary_path / "initialized/project.json"
+        run(
+            sys.executable,
+            str(ROOT / "scripts/meetup-video.py"),
+            "--project",
+            str(initialized),
+            "init",
+            "--name",
+            "Example meetup",
+            "--event-url",
+            "https://example.com/events/meetup",
+        )
+        initialized_project = json.loads(initialized.read_text(encoding="utf-8"))
+        assert initialized_project["event_url"] == "https://example.com/events/meetup"
+        invalid = temporary_path / "invalid/project.json"
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/meetup-video.py"),
+                "--project",
+                str(invalid),
+                "init",
+                "--name",
+                "Invalid",
+                "--event-url",
+                "file:///etc/passwd",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert rejected.returncode and "absolute HTTP(S) URL" in rejected.stderr
+        assert not invalid.parent.exists()
+        project = fixture(temporary_path)
         command = [sys.executable, str(ROOT / "scripts/meetup-video.py"), "--project", str(project)]
         run(*command, "check")
         run(*command, "preview", "--duration", str(DURATION))

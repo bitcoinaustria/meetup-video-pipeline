@@ -206,6 +206,17 @@ def configured_analyzer(project: dict, stage: str, override: str | None = None) 
     return str(provider)
 
 
+def event_context(project: dict) -> dict[str, str]:
+    def text(key: str) -> str:
+        value = project.get(key)
+        return "" if value is None else str(value).strip()
+
+    return {
+        "announcement_url": text("event_url"),
+        "background": text("event_context"),
+    }
+
+
 def run_structured_model(provider: str, schema: dict, prompt: str, timeout: float = 300) -> dict:
     with tempfile.TemporaryDirectory(prefix="meetup-analysis-") as directory:
         workspace = Path(directory)
