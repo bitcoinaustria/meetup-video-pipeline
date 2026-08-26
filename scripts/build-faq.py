@@ -10,6 +10,7 @@ import re
 import statistics
 import subprocess
 import sys
+import tempfile
 import wave
 from pathlib import Path
 
@@ -19,8 +20,10 @@ from video_common import (
     canonical_sha256,
     configured_analyzer,
     content_fingerprint,
+    ensure_slides_text,
     event_context,
     file_sha256,
+    presentation_bounds,
     read_prompt_source,
     resolve_project_path,
     run_structured_model,
@@ -164,8 +167,6 @@ def prepare_audio(video: Path, start: float, end: float, work: Path) -> Path:
             "-t",
             f"{end - start:.3f}",
             "-vn",
-            "-ac",
-            "1",
             "-ar",
             "16000",
             "-c:a",
@@ -179,10 +180,13 @@ def prepare_audio(video: Path, start: float, end: float, work: Path) -> Path:
     return wav
 
 
-def prepare_transcription_audio(wav: Path, work: Path) -> Path:
-    normalized = work / "audio-dynamic.wav"
-    identity_file = work / "audio-dynamic-source.json"
-    identity = content_fingerprint(wav, work / "audio-content.json")
+def prepare_transcription_audio(wav: Path, work: Path, channel: int) -> Path:
+    normalized = work / f"audio-dynamic-channel-{channel}.wav"
+    identity_file = work / f"audio-dynamic-channel-{channel}-source.json"
+    identity = {
+        **content_fingerprint(wav, work / "audio-content.json"),
+        "channel": channel,
+    }
     cached = json.loads(identity_file.read_text(encoding="utf-8")) if identity_file.exists() else None
     if normalized.exists() and cached == identity:
         return normalized
@@ -197,7 +201,7 @@ def prepare_transcription_audio(wav: Path, work: Path) -> Path:
             "-i",
             str(wav),
             "-af",
-            "dynaudnorm=f=150:g=25:p=0.95:m=100",
+            f"pan=mono|c0=c{channel - 1},dynaudnorm=f=150:g=25:p=0.95:m=100",
             "-ar",
             "16000",
             "-c:a",
@@ -311,15 +315,19 @@ def load_segments(
     return segments
 
 
-def annotate_levels(wav_path: Path, segments: list[dict]) -> float:
+def annotate_levels(wav_path: Path, segments: list[dict], channel: int = 1) -> float:
+    if not segments:
+        return -120.0
     with wave.open(str(wav_path), "rb") as audio:
-        if audio.getnchannels() != 1 or audio.getsampwidth() != 2:
-            raise SystemExit("FAQ analysis expects mono 16-bit PCM")
+        channels = audio.getnchannels()
+        if not 1 <= channel <= channels or audio.getsampwidth() != 2:
+            raise SystemExit("FAQ analysis expects a valid channel in 16-bit PCM")
         rate = audio.getframerate()
         for segment in segments:
             audio.setpos(min(audio.getnframes(), round(segment["local_start"] * rate)))
             frames = max(1, round((segment["local_end"] - segment["local_start"]) * rate))
-            samples = array.array("h", audio.readframes(frames))
+            interleaved = array.array("h", audio.readframes(frames))
+            samples = interleaved[channel - 1::channels]
             rms = math.sqrt(sum(value * value for value in samples) / max(1, len(samples)))
             segment["level_dbfs"] = round(20 * math.log10(max(1, rms) / 32768), 1)
     median = statistics.median(segment["level_dbfs"] for segment in segments)
@@ -348,10 +356,11 @@ def candidate_ids(segments: list[dict], quiet_threshold: float) -> list[int]:
 
 
 def write_annotated(path: Path, segments: list[dict], candidates: set[int]) -> None:
-    lines = ["id\tsource time\tlevel dBFS\tcandidate\ttranscript"]
+    lines = ["id\tchannel\tsource time\tlevel dBFS\tcandidate\ttranscript"]
     for segment in segments:
         lines.append(
-            f"S{segment['id']:03d}\t{timestamp(segment['source_start'])}-{timestamp(segment['source_end'])}"
+            f"S{segment['id']:03d}\t{segment['channel']}\t"
+            f"{timestamp(segment['source_start'])}-{timestamp(segment['source_end'])}"
             f"\t{segment['level_dbfs']:.1f}\t{'yes' if segment['id'] in candidates else 'no'}"
             f"\t{segment['text']}"
         )
@@ -360,8 +369,29 @@ def write_annotated(path: Path, segments: list[dict], candidates: set[int]) -> N
                 f"{timestamp(word['start'])}-{timestamp(word['end'])}:{word['text']}"
                 for word in segment["words"]
             )
-            lines.append(f"\tword timing\t\t\t{word_timing}")
+            lines.append(f"\t\tword timing\t\t\t{word_timing}")
     atomic_write_text(path, "\n".join(lines) + "\n")
+
+
+def faq_analysis_channels(project: dict, wav: Path) -> list[int]:
+    with wave.open(str(wav), "rb") as audio:
+        channel_count = audio.getnchannels()
+    audio_edits = (
+        resolve_project_path(project, project["audio_edits"])
+        if project.get("audio_edits")
+        else None
+    )
+    if audio_edits and audio_edits.exists():
+        channels = json.loads(audio_edits.read_text(encoding="utf-8")).get(
+            "channel_analysis", {}
+        ).get("analysis_channels", [])
+        if channels and all(1 <= int(channel) <= channel_count for channel in channels):
+            return [int(channel) for channel in channels]
+    if channel_count == 1:
+        return [1]
+    raise SystemExit(
+        "stereo FAQ analysis requires current audio_edits channel classification; run audio first"
+    )
 
 
 def analysis_schema() -> dict:
@@ -836,58 +866,83 @@ def main() -> None:
     WHISPER_THREADS = int(args.threads or project.get("audio_threads", WHISPER_THREADS))
     video = resolve_project_path(project, project["video"])
     source_duration = duration(video)
-    scan_start = float(project.get("faq_scan_start", project["presentation_start"]))
-    scan_end = float(project.get("faq_scan_end", source_duration))
+    presentation_start, presentation_end = presentation_bounds(project, source_duration)
+    scan_start = float(project.get("faq_scan_start", presentation_start))
+    scan_end = float(project.get("faq_scan_end", presentation_end))
+    if not presentation_start <= scan_start < scan_end <= presentation_end:
+        raise SystemExit("FAQ scan range must stay inside the presentation range")
     work = Path(project["_project_dir"]) / "build/faq-analysis" / project_slug(project, args.project)
     work.mkdir(parents=True, exist_ok=True)
     wav = prepare_audio(video, scan_start, scan_end, work)
+    channels = faq_analysis_channels(project, wav)
     external_transcript = "faq_transcript" in project
-    transcript_path = (
-        resolve_project_path(project, project["faq_transcript"])
-        if external_transcript
-        else work / f"{project.get('name', 'presentation')}-transcript.json"
-    )
-    transcription_wav = wav if external_transcript else prepare_transcription_audio(wav, work)
-    transcript, transcript_start = ensure_transcript(
-        transcript_path,
-        transcription_wav,
-        scan_start,
-        float(project.get("faq_transcript_start", scan_start)),
-        str(project.get("language", "de")),
-        str(
-            project.get(
-                "transcription_prompt",
-                ", ".join(
-                    value
-                    for value in (
-                        project.get("presentation_title"),
-                        project.get("organization"),
-                        "Publikum",
-                        "Frage",
-                    )
-                    if value
-                ),
+    if external_transcript:
+        transcript_channel = int(project.get("faq_transcript_channel", channels[0]))
+        if transcript_channel not in channels or len(channels) > 1 and "faq_transcript_channel" not in project:
+            raise SystemExit(
+                "independent-channel FAQ transcripts require faq_transcript_channel"
             )
-        ),
-        external=external_transcript,
+        channels = [transcript_channel]
+    prompt = str(
+        project.get(
+            "transcription_prompt",
+            ", ".join(
+                value
+                for value in (
+                    project.get("presentation_title"),
+                    project.get("organization"),
+                    "Publikum",
+                    "Frage",
+                )
+                if value
+            ),
+        )
     )
-    segments = load_segments(transcript, transcript_start, scan_start, scan_end)
-    quiet_threshold = annotate_levels(wav, segments)
-    candidates = candidate_ids(segments, quiet_threshold)
+    segments = []
+    transcript_records = []
+    for channel in channels:
+        transcript_path = (
+            resolve_project_path(project, project["faq_transcript"])
+            if external_transcript
+            else work / f"{project.get('name', 'presentation')}-channel-{channel}-transcript.json"
+        )
+        transcription_wav = (
+            wav if external_transcript else prepare_transcription_audio(wav, work, channel)
+        )
+        transcript, transcript_start = ensure_transcript(
+            transcript_path,
+            transcription_wav,
+            scan_start,
+            float(project.get("faq_transcript_start", scan_start)),
+            str(project.get("language", "de")),
+            prompt,
+            external=external_transcript,
+        )
+        channel_segments = load_segments(transcript, transcript_start, scan_start, scan_end)
+        for segment in channel_segments:
+            segment["channel"] = channel
+        quiet_threshold = annotate_levels(wav, channel_segments, channel)
+        local_candidates = set(candidate_ids(channel_segments, quiet_threshold))
+        for segment in channel_segments:
+            segment["candidate"] = segment["id"] in local_candidates
+        segments.extend(channel_segments)
+        transcript_records.append(
+            {
+                "channel": channel,
+                "sha256": file_sha256(transcript),
+                "source_start": transcript_start,
+            }
+        )
+    segments.sort(key=lambda item: (item["source_start"], item["channel"], item["source_end"]))
+    for index, segment in enumerate(segments, 1):
+        segment["id"] = index
+    candidates = [segment["id"] for segment in segments if segment.pop("candidate")]
+    transcript = work / "transcripts.json"
+    atomic_write_json(transcript, transcript_records)
     annotated = work / "annotated-transcript.txt"
     write_annotated(annotated, segments, set(candidates))
 
-    slides_text = resolve_project_path(project, project["slides_text"])
-    if not slides_text.exists():
-        slides_text.parent.mkdir(parents=True, exist_ok=True)
-        run(
-            [
-                "pdftotext",
-                "-layout",
-                str(resolve_project_path(project, project["slides_pdf"])),
-                str(slides_text),
-            ]
-        )
+    slides_text = ensure_slides_text(project)
 
     reviewed_path = (
         resolve_project_path(project, project["faq_reviewed_analysis"])
@@ -954,6 +1009,26 @@ def self_test() -> None:
     assert faq_label({"language": "de"}) == "FRAGE AUS DEM PUBLIKUM"
     assert faq_label({"language": "en"}) == "AUDIENCE QUESTION"
     assert faq_label({"language": "de", "faq_label": "Q&A"}) == "Q&A"
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        stereo = root / "stereo.wav"
+        with wave.open(str(stereo), "wb") as audio:
+            audio.setnchannels(2)
+            audio.setsampwidth(2)
+            audio.setframerate(16000)
+            audio.writeframes(array.array("h", [1000, 4000] * 16000).tobytes())
+        atomic_write_json(
+            root / "audio-edits.json",
+            {"channel_analysis": {"analysis_channels": [1, 2]}},
+        )
+        project = {"_project_dir": directory, "audio_edits": "audio-edits.json"}
+        assert faq_analysis_channels(project, stereo) == [1, 2]
+        first = [{"local_start": 0.0, "local_end": 1.0}]
+        second = [{"local_start": 0.0, "local_end": 1.0}]
+        annotate_levels(stereo, first, 1)
+        annotate_levels(stereo, second, 2)
+        assert second[0]["level_dbfs"] > first[0]["level_dbfs"] + 10
+        assert annotate_levels(stereo, [], 2) == -120.0
     assert legacy_review_identity_matches(
         {"video_path": "source.mp4", "video_size": 10, "video_mtime_ns": 1},
         {

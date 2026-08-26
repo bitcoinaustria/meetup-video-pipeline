@@ -39,6 +39,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_REFINE_MODEL = Path.home() / ".cache/openwhispr/whisper-models/ggml-large-v3.bin"
 DEFAULT_PROJECT = ROOT / "video-project.json"
 DEFAULT_WHISPER = ROOT / "build/whisper.cpp/build/bin/whisper-cli"
+DEFAULT_TYPEWHISPER = Path("/Applications/TypeWhisper.app/Contents/MacOS/typewhisper-cli")
 FILLERS = {"äh", "ähm", "ähhh", "ähmhm", "uh", "uhm", "um"}
 SCAN_FILLERS = FILLERS | {"ah", "eh", "hm"}
 ACOUSTIC_FILLER_WORDS = (SCAN_FILLERS - {"um"}) | {"halt"}
@@ -421,7 +422,9 @@ def resolve_secondary_cli(settings: dict) -> Path | None:
             return Path(resolved) if resolved else None
         return candidate if candidate.exists() else None
     resolved = shutil.which("typewhisper-cli")
-    return Path(resolved) if resolved else None
+    if resolved:
+        return Path(resolved)
+    return DEFAULT_TYPEWHISPER if DEFAULT_TYPEWHISPER.exists() else None
 
 
 def transcribe_secondary_chunks(
@@ -1924,6 +1927,10 @@ def analyze(args: argparse.Namespace) -> None:
 
 
 def self_test() -> None:
+    from unittest.mock import patch
+
+    with patch("shutil.which", return_value=None), patch.object(Path, "exists", return_value=True):
+        assert resolve_secondary_cli({}) == DEFAULT_TYPEWHISPER
     assert legacy_semantic_identity_matches(
         {"source": {"path": "source.mp4", "size": 10, "mtime_ns": 1}},
         {
