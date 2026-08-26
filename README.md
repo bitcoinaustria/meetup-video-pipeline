@@ -81,6 +81,7 @@ Every command accepts the same manifest through `PROJECT`:
 ```sh
 make check PROJECT=projects/my-talk/project.json
 make capabilities PROJECT=projects/my-talk/project.json
+make privacy-seal PROJECT=projects/my-talk/project.json ANALYZER=codex
 make preview PROJECT=projects/my-talk/project.json START=260 DURATION=60
 make approve PROJECT=projects/my-talk/project.json
 make audio PROJECT=projects/my-talk/project.json ANALYZER=codex
@@ -111,7 +112,7 @@ stages. The generator has no vendor-specific default.
 
 `make final` rebuilds context-gated speech edits and audience FAQ coverage, renders at `final_resolution`, validates stereo audio and visible frames, then atomically replaces the configured final output. `make release` additionally regenerates grounded publishing copy. A short 1080p preview followed by explicit `make approve` is the required approval gate before an expensive production render.
 
-Preview approval is content-addressed: if the source, EDL, FAQ timeline, slides, masks, speaker track, or renderer changes, `make final` stops until a new preview is inspected. Final validation samples known full-blur intervals in the artifact, and the final-render sidecar binds Shorts to the exact final file and current EDL/FAQ hashes.
+Privacy approval is content-addressed: `make privacy-seal` binds both masks to the source hash, talk range, geometry, speaker track, qualified detector artifacts, and repository-approved labeled dataset. Preview approval then binds the complete render inputs. Any drift stops final rendering or validation until the affected review is repeated. Final validation samples known full-blur intervals in the artifact, and the final-render sidecar binds Shorts to the exact final file and current EDL/FAQ hashes.
 
 ## Output layout
 
@@ -155,6 +156,7 @@ python3 scripts/score-detections.py labels.tsv --inputs inputs.tsv \
 ```
 
 Set `privacy_detector_qualification` to that artifact and list every implementation and model file in `privacy_detector_artifacts`. The command and file paths must match the manifest exactly; changing any bound file invalidates qualification.
+Qualification output preserves the detector TSV so recall is recomputed at every gate. A maintainer must also approve the exact label/input and detector-artifact hashes in `privacy-detector-trust.json`; project files cannot extend that trust store.
 
 `video-project.example.json` documents all reusable settings. Local project folders and review decisions are ignored by Git; branded layout templates and generator code are versioned.
 

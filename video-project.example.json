@@ -33,6 +33,7 @@
   "faq_accent": "#eb0028",
   "privacy_mask": "build/privacy/mask.mp4",
   "full_blur_mask": "build/privacy/full-blur.mp4",
+  "privacy_provenance": "build/privacy/provenance.json",
   "presentation_start": 0.0,
   "presentation_end": null,
   "shorts_manifest": "shorts.json",

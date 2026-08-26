@@ -269,6 +269,9 @@ def render_identity(project: dict) -> dict:
     audio_edits = optional_project_path(project, "audio_edits")
     if audio_edits and audio_edits.exists():
         files["audio_edits"] = fingerprint("audio-edits", audio_edits)
+    provenance = privacy_provenance_path(project)
+    if provenance.exists():
+        files["privacy_provenance"] = fingerprint("privacy-provenance", provenance)
     slides_dir = project_path(project, "slides")
     files["slides"] = [
         fingerprint(f"slide-{page:03d}", slides_dir / f"page-{page:02d}.jpg")
@@ -300,9 +303,99 @@ def preview_approval_path(project: dict) -> Path:
     return Path(project["_project_dir"]) / "build/preview-approval.json"
 
 
+def privacy_provenance_path(project: dict) -> Path:
+    return resolve_project_path(
+        project, project.get("privacy_provenance", "build/privacy/provenance.json")
+    )
+
+
+def privacy_artifact_identity(project: dict) -> dict:
+    timeline_path = project_path(project, "timeline")
+    timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+    start, end = presentation_bounds(project, float(timeline["duration"]))
+    profile = host_capabilities(project)
+    identity = {
+        "version": 1,
+        "source": source_fingerprint(project),
+        "range": {"start": start, "end": end},
+        "geometry": {
+            key: timeline.get(key)
+            for key in (
+                "source_width",
+                "source_height",
+                "speaker_crop",
+                "screen_crop",
+            )
+        },
+        "timeline": content_fingerprint(timeline_path),
+        "speaker_track": content_fingerprint(
+            resolve_project_path(project, timeline["speaker_track"])
+        ),
+        "privacy_mask": content_fingerprint(project_path(project, "privacy_mask")),
+        "full_blur_mask": content_fingerprint(project_path(project, "full_blur_mask")),
+        "detector": {
+            "identity": profile["signature"]["privacy_detector_identity"],
+            "qualification": profile["signature"][
+                "privacy_detector_qualification_identity"
+            ],
+            "trust": profile["signature"]["privacy_detector_trust_identity"],
+        },
+    }
+    return {**identity, "sha256": canonical_sha256(identity)}
+
+
+def seal_privacy(project: dict, reviewed_by: str) -> Path:
+    if not reviewed_by.strip():
+        raise SystemExit("privacy review requires a reviewer identifier")
+    detector = host_capabilities(project)["privacy_detector"]
+    if not detector["available"] or not detector.get("qualified", False):
+        raise SystemExit("privacy review requires a qualified, available detector")
+    timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
+    start, end = presentation_bounds(project, float(timeline["duration"]))
+    for key in ("privacy_mask", "full_blur_mask"):
+        if duration(project_path(project, key)) + 1 / 30 < end - start:
+            raise SystemExit(f"{key} is too short for the presentation range")
+    path = privacy_provenance_path(project)
+    atomic_write_json(
+        path,
+        {
+            "version": 1,
+            "status": "approved",
+            "reviewed_by": reviewed_by.strip(),
+            "identity": privacy_artifact_identity(project),
+        },
+    )
+    return path
+
+
+def require_privacy_provenance(project: dict) -> None:
+    path = privacy_provenance_path(project)
+    try:
+        provenance = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit("privacy provenance is missing or invalid; review and seal the masks") from error
+    if (
+        provenance.get("status") != "approved"
+        or not provenance.get("reviewed_by")
+        or provenance.get("identity") != privacy_artifact_identity(project)
+    ):
+        raise SystemExit("privacy provenance is stale; review and seal the masks again")
+
+
 def final_metadata_path(project: dict) -> Path:
     configured = project.get("final_metadata", "output/metadata/final-render.json")
     return resolve_project_path(project, configured)
+
+
+def require_current_final_metadata(project: dict, path: Path) -> None:
+    try:
+        metadata = json.loads(final_metadata_path(project).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit("final render metadata is missing or invalid") from error
+    if metadata.get("identity", {}).get("sha256") != render_identity(project)["sha256"]:
+        raise SystemExit("final render metadata is stale for the current project inputs")
+    if metadata.get("artifact") != content_fingerprint(path):
+        raise SystemExit("final render does not match its metadata")
 
 
 def validate_render(
@@ -657,6 +750,7 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
             "a qualified privacy detector is required: "
             f"{detector.get('reason') or 'detector is unavailable'}"
         )
+    require_privacy_provenance(project)
     print(
         "inputs and privacy checks passed; "
         f"encoder: {profile['video_encoder']['name']}; "
@@ -978,6 +1072,8 @@ def main() -> None:
     init.add_argument("--event-url")
     subparsers.add_parser("capabilities")
     subparsers.add_parser("check")
+    privacy_seal = subparsers.add_parser("privacy-seal")
+    privacy_seal.add_argument("--reviewed-by", required=True)
     preview = subparsers.add_parser("preview")
     preview.add_argument("--start", type=float)
     preview.add_argument("--duration", type=float, default=60.0)
@@ -1005,6 +1101,8 @@ def main() -> None:
         print(json.dumps({**profile, "resources": project["_resources"]}, indent=2))
     elif args.command == "check":
         check(project, args.project)
+    elif args.command == "privacy-seal":
+        print(seal_privacy(project, args.reviewed_by))
     elif args.command == "preview":
         start = args.start if args.start is not None else float(project["presentation_start"])
         output = (
@@ -1061,6 +1159,9 @@ def main() -> None:
         resolution = args.resolution or (
             "1920x1080" if args.input else project.get("final_resolution", "3840x2160")
         )
+        if not args.input:
+            require_privacy_provenance(project)
+            require_current_final_metadata(project, target)
         validate_render(
             target,
             resolution,

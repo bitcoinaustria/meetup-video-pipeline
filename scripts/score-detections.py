@@ -8,48 +8,13 @@ import tempfile
 from pathlib import Path
 
 from video_common import (
+    actual_detection_counts as detected_counts,
     atomic_write_json,
     detector_command_identity,
+    expected_detection_counts as expected_counts,
     file_sha256,
-    parse_detection_coordinates,
+    score_detection_counts as score,
 )
-
-
-def expected_counts(path: Path) -> dict[float, int]:
-    rows = (
-        line for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    )
-    return {float(timestamp): int(count) for timestamp, count in (line.split("\t", 1) for line in rows)}
-
-
-def detected_counts(path: Path) -> dict[float, int]:
-    counts = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        timestamp, encoded = (line.split("\t", 1) + [""])[:2]
-        counts[float(timestamp)] = len(parse_detection_coordinates(encoded))
-    return counts
-
-
-def score(labels: dict[float, int], detections: dict[float, int]) -> dict[str, float]:
-    people = [time for time, count in labels.items() if count > 0]
-    overlaps = [time for time, count in labels.items() if count > 1]
-    exact = sum(detections.get(time, 0) == count for time, count in labels.items())
-    any_recall = (
-        sum(detections.get(time, 0) > 0 for time in people) / len(people) if people else 1.0
-    )
-    overlap_recall = (
-        sum(detections.get(time, 0) > 1 for time in overlaps) / len(overlaps)
-        if overlaps
-        else 1.0
-    )
-    return {
-        "any_person_recall": any_recall,
-        "overlap_recall": overlap_recall,
-        "exact_count_accuracy": exact / max(1, len(labels)),
-    }
 
 
 def run_detector(command: str, inputs: Path, output: Path) -> list[str]:
@@ -111,9 +76,8 @@ def main() -> None:
             raise SystemExit(
                 "--qualification-output requires --detector-command, --detector-artifact, and --inputs"
             )
-        temporary = tempfile.NamedTemporaryFile(suffix=".tsv", delete=False)
-        generated = Path(temporary.name)
-        temporary.close()
+        generated = args.qualification_output.with_suffix(".detections.tsv").resolve()
+        generated.parent.mkdir(parents=True, exist_ok=True)
         try:
             detector_command = run_detector(args.detector_command, args.inputs, generated)
         except Exception:
@@ -141,6 +105,11 @@ def main() -> None:
                 "labels_sha256": file_sha256(args.labels),
                 "inputs_sha256": file_sha256(args.inputs),
                 "detections_sha256": file_sha256(detections),
+                "files": {
+                    "labels": str(args.labels.resolve()),
+                    "inputs": str(args.inputs.resolve()),
+                    "detections": str(detections.resolve()),
+                },
                 "thresholds": {
                     "minimum_any_recall": args.minimum_any_recall,
                     "minimum_overlap_recall": args.minimum_overlap_recall,
@@ -149,8 +118,6 @@ def main() -> None:
                 "passed": passed,
             },
         )
-    if generated:
-        generated.unlink(missing_ok=True)
     if result["any_person_recall"] < args.minimum_any_recall:
         raise SystemExit("detector misses too many people")
     if result["overlap_recall"] < args.minimum_overlap_recall:

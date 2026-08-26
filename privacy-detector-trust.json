@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "approved_qualifications": [
+    {
+      "name": "repository contract fixture",
+      "labels_sha256": "7a62d8b6b45aa3d2c07ee5a339d1ad13107c7622e35de35ec84e24b831b52f6e",
+      "inputs_sha256": "2b40aaae7e1bd8c4c8cf30fa44dff0afa54179c86ad5f86898eb713ccdb3f24a",
+      "detector_artifact_sha256s": [
+        "22ff093b4113ed39da42808189d6b25df6ec92a1001093c46ed24090114d42de"
+      ]
+    }
+  ]
+}

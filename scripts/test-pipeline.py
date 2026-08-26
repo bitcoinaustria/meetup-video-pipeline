@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 
+import contextlib
+import importlib.util
+import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -8,7 +12,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from video_common import atomic_write_json, atomic_write_text, detector_command_identity
+from video_common import atomic_write_json, atomic_write_text
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -186,26 +190,25 @@ def fixture(directory: Path) -> Path:
     }
     detector_command = [
         sys.executable,
-        str(ROOT / "scripts/test-pipeline.py"),
+        str(ROOT / "scripts/test-people-detector.py"),
         "{inputs}",
         "{output}",
     ]
     project["privacy_detector_command"] = detector_command
-    project["privacy_detector_artifacts"] = [str(ROOT / "scripts/test-pipeline.py")]
+    project["privacy_detector_artifacts"] = [str(ROOT / "scripts/test-people-detector.py")]
     project["privacy_detector_qualification"] = "build/detector-qualification.json"
-    atomic_write_json(
-        directory / project["privacy_detector_qualification"],
-        {
-            "version": 1,
-            "parser_policy": "minimum-height-0.12-v1",
-            "detector": detector_command_identity(
-                detector_command, directory, project["privacy_detector_artifacts"]
-            ),
-            "labels_sha256": "synthetic-labels",
-            "inputs_sha256": "synthetic-inputs",
-            "detections_sha256": "synthetic-detections",
-            "metrics": {"any_person_recall": 1.0, "overlap_recall": 1.0},
-        },
+    run(
+        sys.executable,
+        str(ROOT / "scripts/score-detections.py"),
+        str(ROOT / "tests/privacy-detector/labels.tsv"),
+        "--inputs",
+        str(ROOT / "tests/privacy-detector/inputs.tsv"),
+        "--detector-command",
+        shlex.join(detector_command),
+        "--detector-artifact",
+        project["privacy_detector_artifacts"][0],
+        "--qualification-output",
+        str(directory / project["privacy_detector_qualification"]),
     )
     project_file = directory / "project.json"
     atomic_write_json(project_file, project)
@@ -265,6 +268,7 @@ def main() -> None:
         assert not invalid.parent.exists()
         project = fixture(temporary_path)
         command = [sys.executable, str(ROOT / "scripts/meetup-video.py"), "--project", str(project)]
+        run(*command, "privacy-seal", "--reviewed-by", "synthetic test")
         timeline_path = project.parent / "build/timeline.json"
         timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
         atomic_write_json(timeline_path, {**timeline, "duration": DURATION - 0.5})
@@ -313,13 +317,22 @@ def main() -> None:
             "black",
             (1.0, 1.19),
         )
-        edited_privacy = subprocess.run(
+        spec = importlib.util.spec_from_file_location("meetup_video", ROOT / "scripts/meetup-video.py")
+        assert spec and spec.loader
+        meetup_video = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(meetup_video)
+        loaded_project = json.loads(project.read_text(encoding="utf-8"))
+        loaded_project["_project_dir"] = str(project.parent)
+        privacy_output = io.StringIO()
+        with contextlib.redirect_stdout(privacy_output):
+            meetup_video.validate_privacy_render(final, loaded_project, "1920x1080")
+        assert "all 1 full-blur intervals are removed by the EDL" in privacy_output.getvalue()
+        stale_privacy = subprocess.run(
             [*command, "validate", "--resolution", "1920x1080"],
-            check=True,
             capture_output=True,
             text=True,
         )
-        assert "all 1 full-blur intervals are removed by the EDL" in edited_privacy.stdout
+        assert stale_privacy.returncode and "privacy provenance is stale" in stale_privacy.stderr
     print("synthetic check -> preview -> final -> validate passed")
 
 

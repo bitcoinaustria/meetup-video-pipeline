@@ -20,7 +20,7 @@ Use this procedure when a user points at meetup source files and asks for a fini
 
 ## Production
 
-1. Build or import the project-local slide images, timeline, speaker track, privacy mask, and full-blur mask referenced by the manifest. Do not reuse another camera's geometry without validating it against sampled frames.
+1. Build or import the project-local slide images, timeline, speaker track, privacy mask, and full-blur mask referenced by the manifest. Inspect privacy review footage across every ambiguity window, then run `make privacy-seal PROJECT=<project> ANALYZER=<agent>`. Do not reuse another camera's geometry or masks.
 2. Run `make check PROJECT=<project>`. Any missing audience turn, stale review identity, ambiguous privacy interval, or mismatched audio source is a blocker.
 3. Run `make preview PROJECT=<project> START=<seconds> DURATION=60`. Inspect the opening, a tracking movement, a privacy overlap, an FAQ card, and a hard speech cut. Show or report the preview and obtain approval, then run `make approve PROJECT=<project>`.
 4. Run `make final PROJECT=<project> ANALYZER=<agent>`. The command rebuilds audio and FAQ decisions, rejects any drift from the approved preview, renders the configured production resolution, validates duration and known full-blur intervals, and only then replaces the previous final atomically.

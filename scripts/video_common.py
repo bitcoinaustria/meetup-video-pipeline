@@ -14,6 +14,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+DETECTOR_TRUST = ROOT / "privacy-detector-trust.json"
 _HOST_CAPABILITY_CACHE: dict[str, dict] = {}
 
 
@@ -164,6 +165,61 @@ def parse_detection_coordinates(encoded: str, minimum_height: float = 0.12) -> l
     return [box for box in boxes if len(box) == 4 and box[3] >= minimum_height]
 
 
+def expected_detection_counts(path: Path) -> dict[float, int]:
+    rows = (
+        line
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    )
+    return {
+        float(timestamp): int(count)
+        for timestamp, count in (line.split("\t", 1) for line in rows)
+    }
+
+
+def actual_detection_counts(path: Path) -> dict[float, int]:
+    counts = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        timestamp, encoded = (line.split("\t", 1) + [""])[:2]
+        counts[float(timestamp)] = len(parse_detection_coordinates(encoded))
+    return counts
+
+
+def score_detection_counts(labels: dict[float, int], detections: dict[float, int]) -> dict[str, float]:
+    people = [time for time, count in labels.items() if count > 0]
+    overlaps = [time for time, count in labels.items() if count > 1]
+    exact = sum(detections.get(time, 0) == count for time, count in labels.items())
+    return {
+        "any_person_recall": (
+            sum(detections.get(time, 0) > 0 for time in people) / len(people)
+            if people
+            else 1.0
+        ),
+        "overlap_recall": (
+            sum(detections.get(time, 0) > 1 for time in overlaps) / len(overlaps)
+            if overlaps
+            else 1.0
+        ),
+        "exact_count_accuracy": exact / max(1, len(labels)),
+    }
+
+
+def detector_qualification_is_trusted(artifact: dict, detector_identity: dict) -> bool:
+    try:
+        trust = json.loads(DETECTOR_TRUST.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    artifact_hashes = sorted(item["sha256"] for item in detector_identity.get("artifacts", []))
+    return trust.get("version") == 1 and any(
+        entry.get("labels_sha256") == artifact.get("labels_sha256")
+        and entry.get("inputs_sha256") == artifact.get("inputs_sha256")
+        and sorted(entry.get("detector_artifact_sha256s", [])) == artifact_hashes
+        for entry in trust.get("approved_qualifications", [])
+    )
+
+
 def detector_qualification(project: dict, command: object) -> dict[str, object]:
     configured = project.get("privacy_detector_command", project.get("people_detector"))
     if not configured and platform.system() == "Darwin":
@@ -176,12 +232,25 @@ def detector_qualification(project: dict, command: object) -> dict[str, object]:
         artifact = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         return {"qualified": False, "reason": f"invalid qualification artifact: {error}"}
-    metrics = artifact.get("metrics", {})
     try:
         detector_identity = detector_command_identity(
             command,
             Path(project.get("_project_dir", ROOT)),
             project.get("privacy_detector_artifacts"),
+        )
+        trusted = detector_qualification_is_trusted(artifact, detector_identity)
+        files = artifact.get("files", {})
+        labels = Path(files["labels"])
+        inputs = Path(files["inputs"])
+        detections = Path(files["detections"])
+        if (
+            file_sha256(labels) != artifact.get("labels_sha256")
+            or file_sha256(inputs) != artifact.get("inputs_sha256")
+            or file_sha256(detections) != artifact.get("detections_sha256")
+        ):
+            raise ValueError("qualification files do not match their recorded hashes")
+        metrics = score_detection_counts(
+            expected_detection_counts(labels), actual_detection_counts(detections)
         )
         qualified = bool(
             artifact.get("version") == 1
@@ -191,14 +260,20 @@ def detector_qualification(project: dict, command: object) -> dict[str, object]:
             and artifact.get("labels_sha256")
             and artifact.get("inputs_sha256")
             and artifact.get("detections_sha256")
+            and artifact.get("metrics") == metrics
             and float(metrics.get("any_person_recall", 0)) >= 0.99
             and float(metrics.get("overlap_recall", 0)) >= 0.90
+            and trusted
         )
-    except (TypeError, ValueError) as error:
+    except (KeyError, OSError, TypeError, ValueError) as error:
         qualified = False
         reason = str(error)
     else:
-        reason = "qualification does not match detector or recall contract"
+        reason = (
+            "qualification dataset is not approved by the repository trust store"
+            if not trusted
+            else "qualification does not match detector or recall contract"
+        )
     return {
         "qualified": qualified,
         "source": str(path),
@@ -247,6 +322,7 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
         "privacy_detector_qualification_identity": (
             content_fingerprint(qualification) if qualification and qualification.exists() else None
         ),
+        "privacy_detector_trust_identity": content_fingerprint(DETECTOR_TRUST),
         "ocr_command": project.get("ocr_command"),
     }
     cache_key = json.dumps(signature, ensure_ascii=False, sort_keys=True)

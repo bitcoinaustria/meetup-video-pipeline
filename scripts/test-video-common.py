@@ -20,6 +20,7 @@ from video_common import (
     encoder_options,
     event_context,
     ffconcat_quote,
+    file_sha256,
     host_capabilities,
     privacy_detector_command,
     presentation_bounds,
@@ -33,6 +34,10 @@ from video_common import (
 )
 
 
+ROOT = Path(__file__).resolve().parent.parent
+FIXTURE_DETECTOR = ROOT / "scripts/test-people-detector.py"
+FIXTURE_LABELS = ROOT / "tests/privacy-detector/labels.tsv"
+FIXTURE_INPUTS = ROOT / "tests/privacy-detector/inputs.tsv"
 edits = [{"source_start": 12, "source_end": 13}]
 faq = [{"source_start": 14, "duration": 5}]
 assert source_to_output(12, 10, edits, faq) == 2
@@ -50,8 +55,8 @@ assert encoder_options("h264_nvenc", "ultrafast") == ["-c:v", "h264_nvenc"]
 assert encoder_options("libx264", "slow") == ["-c:v", "libx264", "-preset", "slow"]
 assert resource_budget(4, 1, 1)["threads_per_job"] >= 1
 assert resource_budget(1, 1, 4)["threads_per_job"] == max(1, (os.cpu_count() or 1) // 4)
-detector = [sys.executable, "detector.py", "{inputs}", "{output}"]
-detector_string = f'"{sys.executable}" detector.py {{inputs}} {{output}}'
+detector = [sys.executable, str(FIXTURE_DETECTOR), "{inputs}", "{output}"]
+detector_string = f'"{sys.executable}" "{FIXTURE_DETECTOR}" {{inputs}} {{output}}'
 detector_status = _command_status(detector_string)
 assert detector_status["available"] and Path(detector_status["command"]).samefile(sys.executable)
 try:
@@ -128,18 +133,30 @@ assert list(
 ) == [(" word", 0.1, 0.2, 0.9)]
 
 with tempfile.TemporaryDirectory() as directory:
-    detector_script = Path(directory) / "detector.py"
-    detector_script.write_text("# test detector\n", encoding="utf-8")
-    detector_artifacts = [str(detector_script)]
+    detector_artifacts = [str(FIXTURE_DETECTOR)]
     qualification = Path(directory) / "qualification.json"
+    qualification_detections = Path(directory) / "qualification.detections.tsv"
+    qualification_detections.write_text(
+        "0\t\n1\t0,0,1,1\n2\t0,0,1,1;0,0,1,1\n",
+        encoding="utf-8",
+    )
     atomic_qualification = {
         "version": 1,
         "parser_policy": "minimum-height-0.12-v1",
         "detector": detector_command_identity(detector, Path(directory), detector_artifacts),
-        "labels_sha256": "labels",
-        "inputs_sha256": "inputs",
-        "detections_sha256": "detections",
-        "metrics": {"any_person_recall": 1.0, "overlap_recall": 1.0},
+        "labels_sha256": file_sha256(FIXTURE_LABELS),
+        "inputs_sha256": file_sha256(FIXTURE_INPUTS),
+        "detections_sha256": file_sha256(qualification_detections),
+        "files": {
+            "labels": str(FIXTURE_LABELS),
+            "inputs": str(FIXTURE_INPUTS),
+            "detections": str(qualification_detections),
+        },
+        "metrics": {
+            "any_person_recall": 1.0,
+            "overlap_recall": 1.0,
+            "exact_count_accuracy": 1.0,
+        },
     }
     qualification.write_text(json.dumps(atomic_qualification), encoding="utf-8")
     for configured in (detector, detector_string):
