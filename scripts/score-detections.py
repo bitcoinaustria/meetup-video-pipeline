@@ -7,7 +7,12 @@ import sys
 import tempfile
 from pathlib import Path
 
-from video_common import atomic_write_json, command_identity, file_sha256, parse_detection_coordinates
+from video_common import (
+    atomic_write_json,
+    detector_command_identity,
+    file_sha256,
+    parse_detection_coordinates,
+)
 
 
 def expected_counts(path: Path) -> dict[float, int]:
@@ -89,6 +94,7 @@ def main() -> None:
     parser.add_argument("--minimum-any-recall", type=float, default=0.99)
     parser.add_argument("--minimum-overlap-recall", type=float, default=0.90)
     parser.add_argument("--detector-command")
+    parser.add_argument("--detector-artifact", action="append", default=[])
     parser.add_argument("--inputs", type=Path)
     parser.add_argument("--qualification-output", type=Path)
     parser.add_argument("--self-test", action="store_true")
@@ -101,9 +107,9 @@ def main() -> None:
     generated = None
     detector_command = None
     if args.qualification_output:
-        if not args.detector_command or not args.inputs:
+        if not args.detector_command or not args.inputs or not args.detector_artifact:
             raise SystemExit(
-                "--qualification-output requires --detector-command and --inputs"
+                "--qualification-output requires --detector-command, --detector-artifact, and --inputs"
             )
         temporary = tempfile.NamedTemporaryFile(suffix=".tsv", delete=False)
         generated = Path(temporary.name)
@@ -129,7 +135,9 @@ def main() -> None:
             {
                 "version": 1,
                 "parser_policy": "minimum-height-0.12-v1",
-                "detector": command_identity(detector_command, Path.cwd()),
+                "detector": detector_command_identity(
+                    detector_command, Path.cwd(), args.detector_artifact
+                ),
                 "labels_sha256": file_sha256(args.labels),
                 "inputs_sha256": file_sha256(args.inputs),
                 "detections_sha256": file_sha256(detections),

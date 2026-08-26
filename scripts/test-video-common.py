@@ -13,7 +13,7 @@ from unittest.mock import patch
 from video_common import (
     _command_status,
     build_time_map,
-    command_identity,
+    detector_command_identity,
     configured_analyzer,
     content_fingerprint,
     encoder_candidates,
@@ -24,6 +24,7 @@ from video_common import (
     privacy_detector_command,
     presentation_bounds,
     resource_budget,
+    require_claude_safe_mode,
     run_structured_model,
     source_range_output_duration,
     source_to_output,
@@ -53,6 +54,12 @@ detector = [sys.executable, "detector.py", "{inputs}", "{output}"]
 detector_string = f'"{sys.executable}" detector.py {{inputs}} {{output}}'
 detector_status = _command_status(detector_string)
 assert detector_status["available"] and Path(detector_status["command"]).samefile(sys.executable)
+try:
+    detector_command_identity(detector)
+except ValueError as error:
+    assert "privacy_detector_artifacts" in str(error)
+else:
+    raise AssertionError("configured detectors must bind their implementation artifacts")
 if platform.system() != "Darwin":
     try:
         privacy_detector_command({})
@@ -64,15 +71,27 @@ if platform.system() != "Darwin":
 large_prompt = "x" * 200_000
 schema = {"type": "object"}
 with patch("video_common.subprocess.run") as model_run:
-    model_run.return_value = SimpleNamespace(
-        stdout=json.dumps({"structured_output": {"ok": True}})
-    )
+    require_claude_safe_mode.cache_clear()
+    model_run.side_effect = [
+        SimpleNamespace(stdout="--safe-mode", stderr=""),
+        SimpleNamespace(stdout=json.dumps({"structured_output": {"ok": True}})),
+    ]
     assert run_structured_model("claude", schema, large_prompt) == {"ok": True}
     assert model_run.call_args.kwargs["input"] == large_prompt
     assert large_prompt not in model_run.call_args.args[0]
     claude_command = model_run.call_args.args[0]
     assert claude_command[claude_command.index("--mcp-config") + 1] == '{"mcpServers":{}}'
     assert claude_command[claude_command.index("--tools") + 1] == ""
+    require_claude_safe_mode.cache_clear()
+with patch("video_common.subprocess.run") as model_run:
+    model_run.return_value = SimpleNamespace(stdout="", stderr="")
+    try:
+        require_claude_safe_mode()
+    except SystemExit as error:
+        assert "--safe-mode" in str(error)
+    else:
+        raise AssertionError("unsafe Claude CLI must fail closed")
+    require_claude_safe_mode.cache_clear()
 with patch("video_common.subprocess.run") as model_run:
     model_run.return_value = SimpleNamespace(stdout=json.dumps({"ok": True}))
     assert run_structured_model("codex", schema, large_prompt) == {"ok": True}
@@ -109,11 +128,14 @@ assert list(
 ) == [(" word", 0.1, 0.2, 0.9)]
 
 with tempfile.TemporaryDirectory() as directory:
+    detector_script = Path(directory) / "detector.py"
+    detector_script.write_text("# test detector\n", encoding="utf-8")
+    detector_artifacts = [str(detector_script)]
     qualification = Path(directory) / "qualification.json"
     atomic_qualification = {
         "version": 1,
         "parser_policy": "minimum-height-0.12-v1",
-        "detector": command_identity(detector, Path(directory)),
+        "detector": detector_command_identity(detector, Path(directory), detector_artifacts),
         "labels_sha256": "labels",
         "inputs_sha256": "inputs",
         "detections_sha256": "detections",
@@ -125,6 +147,7 @@ with tempfile.TemporaryDirectory() as directory:
             {
                 "_project_dir": directory,
                 "privacy_detector_command": configured,
+                "privacy_detector_artifacts": detector_artifacts,
                 "privacy_detector_qualification": str(qualification),
             }
         )
@@ -134,6 +157,7 @@ with tempfile.TemporaryDirectory() as directory:
         "final_resolution": "1920x1080",
         "encoder": "libx265",
         "privacy_detector_command": detector,
+        "privacy_detector_artifacts": detector_artifacts,
         "privacy_detector_qualification": str(qualification),
     }
     with (

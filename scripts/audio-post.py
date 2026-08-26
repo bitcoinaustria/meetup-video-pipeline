@@ -1230,6 +1230,14 @@ def speaker_context(project: dict, source: dict) -> dict:
     reviewed = project_path(project, "faq_reviewed_analysis")
     presentation_start = float(project.get("presentation_start", 0))
     source_duration = float(source["video_duration"])
+    source_range = source.get("range", {})
+    range_start = float(source_range.get("start", presentation_start))
+    configured_duration = source_range.get("duration")
+    range_end = (
+        source_duration
+        if configured_duration is None
+        else min(source_duration, range_start + float(configured_duration))
+    )
     turns = []
     valid = False
     invalid_reason = "missing reviewed FAQ speaker context"
@@ -1242,7 +1250,10 @@ def speaker_context(project: dict, source: dict) -> dict:
         expected_video = project_path(project, "video")
         turns = data.get("turns", [])
         valid_turns = all(
-            0 <= float(turn.get("source_start", -1)) < float(turn.get("source_end", -1)) <= source_duration + 1 / 30
+            range_start - 1 / 30
+            <= float(turn.get("source_start", -1))
+            < float(turn.get("source_end", -1))
+            <= range_end + 1 / 30
             for turn in turns
         )
         fingerprint_matches = (
@@ -1254,11 +1265,11 @@ def speaker_context(project: dict, source: dict) -> dict:
             and video_path.resolve() == expected_video.resolve()
             and fingerprint_matches
             and abs(float(identity.get("video_duration", -1)) - source_duration) <= 1 / 30
-            and float(identity.get("scan_start", math.inf)) <= presentation_start + 1 / 30
-            and float(identity.get("scan_end", -1)) >= source_duration - 1 / 30
+            and float(identity.get("scan_start", math.inf)) <= range_start + 1 / 30
+            and float(identity.get("scan_end", -1)) >= range_end - 1 / 30
             and valid_turns
         )
-        invalid_reason = "reviewed FAQ speaker context does not match the complete current source"
+        invalid_reason = "reviewed FAQ speaker context does not match the current talk range"
     if not valid:
         turns = []
     audience = [(float(turn["source_start"]), float(turn["source_end"])) for turn in turns]
@@ -2053,6 +2064,38 @@ def self_test() -> None:
             audio.setframerate(16000)
             audio.writeframes(array.array("h", [1000] * 16000).tobytes())
         assert analyze_channels(mono)["render_policy"] == "process_once_then_duplicate_to_stereo"
+        video = Path(directory) / "source.mp4"
+        video.write_bytes(b"talk range source")
+        reviewed = Path(directory) / "reviewed.json"
+        atomic_write_json(
+            reviewed,
+            {
+                "identity": {
+                    "video_path": "source.mp4",
+                    "size": video.stat().st_size,
+                    "sha256": file_sha256(video),
+                    "video_duration": 30.0,
+                    "scan_start": 10.0,
+                    "scan_end": 20.0,
+                },
+                "turns": [{"source_start": 12.0, "source_end": 13.0}],
+            },
+        )
+        context = speaker_context(
+            {
+                "_project_dir": directory,
+                "video": "source.mp4",
+                "faq_reviewed_analysis": "reviewed.json",
+                "presentation_start": 10.0,
+            },
+            {
+                "size": video.stat().st_size,
+                "sha256": file_sha256(video),
+                "video_duration": 30.0,
+                "range": {"start": 10.0, "duration": 10.0},
+            },
+        )
+        assert context["coverage_valid"] and context["audience_intervals"] == [(12.0, 13.0)]
     print("audio-post self-test: ok")
 
 

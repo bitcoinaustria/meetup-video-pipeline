@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import bisect
+import functools
 import hashlib
 import json
 import os
@@ -135,6 +136,29 @@ def command_identity(command: object, base: Path = ROOT) -> dict:
     return {"command": parts, "files": files}
 
 
+def detector_command_identity(
+    command: object, base: Path = ROOT, artifacts: list[str] | None = None
+) -> dict:
+    if not isinstance(artifacts, list) or not artifacts or not all(
+        isinstance(value, str) and value for value in artifacts
+    ):
+        raise ValueError("privacy_detector_artifacts must list detector code and model files")
+    identity = command_identity(command, base)
+    bound = []
+    for value in artifacts:
+        path = resolve_project_path({"_project_dir": str(base)}, value)
+        if not path.is_file():
+            raise ValueError(f"detector artifact is unavailable: {path}")
+        bound.append(
+            {
+                "path": str(path.resolve()),
+                "size": path.stat().st_size,
+                "sha256": file_sha256(path),
+            }
+        )
+    return {**identity, "artifacts": bound}
+
+
 def parse_detection_coordinates(encoded: str, minimum_height: float = 0.12) -> list[tuple[float, ...]]:
     boxes = [tuple(map(float, item.split(","))) for item in encoded.split(";") if item]
     return [box for box in boxes if len(box) == 4 and box[3] >= minimum_height]
@@ -154,23 +178,31 @@ def detector_qualification(project: dict, command: object) -> dict[str, object]:
         return {"qualified": False, "reason": f"invalid qualification artifact: {error}"}
     metrics = artifact.get("metrics", {})
     try:
+        detector_identity = detector_command_identity(
+            command,
+            Path(project.get("_project_dir", ROOT)),
+            project.get("privacy_detector_artifacts"),
+        )
         qualified = bool(
             artifact.get("version") == 1
             and artifact.get("parser_policy") == "minimum-height-0.12-v1"
             and artifact.get("detector")
-            == command_identity(command, Path(project.get("_project_dir", ROOT)))
+            == detector_identity
             and artifact.get("labels_sha256")
             and artifact.get("inputs_sha256")
             and artifact.get("detections_sha256")
             and float(metrics.get("any_person_recall", 0)) >= 0.99
             and float(metrics.get("overlap_recall", 0)) >= 0.90
         )
-    except (TypeError, ValueError):
+    except (TypeError, ValueError) as error:
         qualified = False
+        reason = str(error)
+    else:
+        reason = "qualification does not match detector or recall contract"
     return {
         "qualified": qualified,
         "source": str(path),
-        "reason": "" if qualified else "qualification does not match detector or recall contract",
+        "reason": "" if qualified else reason,
     }
 
 
@@ -184,6 +216,21 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
     default_people = ROOT / "scripts/vision-people.swift" if system == "Darwin" else None
     detector_command = project.get("privacy_detector_command", project.get("people_detector"))
     qualification = optional_project_path(project, "privacy_detector_qualification")
+    try:
+        detector_identity = (
+            detector_command_identity(
+                detector_command,
+                project_dir,
+                project.get("privacy_detector_artifacts"),
+            )
+            if detector_command
+            else command_identity(default_people, project_dir)
+        )
+    except ValueError as error:
+        detector_identity = {
+            "command": command_identity(detector_command, project_dir),
+            "error": str(error),
+        }
     signature = {
         "system": system,
         "machine": platform.machine(),
@@ -196,7 +243,7 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
             "privacy_detector_command", project.get("people_detector")
         ),
         "privacy_detector_qualification": project.get("privacy_detector_qualification"),
-        "privacy_detector_identity": command_identity(detector_command or default_people, project_dir),
+        "privacy_detector_identity": detector_identity,
         "privacy_detector_qualification_identity": (
             content_fingerprint(qualification) if qualification and qualification.exists() else None
         ),
@@ -511,10 +558,27 @@ def event_context(project: dict) -> dict[str, str]:
     }
 
 
+@functools.lru_cache(maxsize=1)
+def require_claude_safe_mode() -> None:
+    try:
+        result = subprocess.run(
+            ["claude", "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise SystemExit(f"Claude CLI capability check failed: {error}") from error
+    if "--safe-mode" not in f"{result.stdout}\n{result.stderr}":
+        raise SystemExit("Claude CLI does not support the required --safe-mode isolation flag")
+
+
 def run_structured_model(provider: str, schema: dict, prompt: str, timeout: float = 300) -> dict:
     with tempfile.TemporaryDirectory(prefix="meetup-analysis-") as directory:
         workspace = Path(directory)
         if provider == "claude":
+            require_claude_safe_mode()
             command = [
                 "claude", "-p", "--safe-mode", "--setting-sources", "user",
                 "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--tools", "",

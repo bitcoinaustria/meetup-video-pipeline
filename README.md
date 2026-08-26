@@ -14,7 +14,7 @@ The generator is presentation-neutral and host-portable: event facts, source pat
 - Xcode Command Line Tools on macOS for Apple Vision detection and OCR, or a qualified detector command on other platforms
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) plus a local Large-v3 model
 - TypeWhisper with Parakeet TDT v3 when the secondary audio pass is required
-- The CLI for the analyzer selected by the invoking agent (`codex` or `claude`)
+- The CLI for the analyzer selected by the invoking agent (`codex` or a Claude CLI that supports `--safe-mode`)
 
 On macOS:
 
@@ -150,10 +150,11 @@ Use `scripts/score-detections.py` against labeled count TSVs before adopting a d
 ```sh
 python3 scripts/score-detections.py labels.tsv --inputs inputs.tsv \
   --detector-command '/usr/bin/python3 /opt/people-detector.py {inputs} {output}' \
+  --detector-artifact /opt/people-detector.py \
   --qualification-output build/detector-qualification.json
 ```
 
-Set `privacy_detector_qualification` to that artifact. The command and file paths must match the manifest exactly; changing detector code invalidates qualification.
+Set `privacy_detector_qualification` to that artifact and list every implementation and model file in `privacy_detector_artifacts`. The command and file paths must match the manifest exactly; changing any bound file invalidates qualification.
 
 `video-project.example.json` documents all reusable settings. Local project folders and review decisions are ignored by Git; branded layout templates and generator code are versioned.
 

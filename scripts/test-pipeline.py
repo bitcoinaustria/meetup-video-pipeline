@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from video_common import atomic_write_json, atomic_write_text, command_identity
+from video_common import atomic_write_json, atomic_write_text, detector_command_identity
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -191,13 +191,16 @@ def fixture(directory: Path) -> Path:
         "{output}",
     ]
     project["privacy_detector_command"] = detector_command
+    project["privacy_detector_artifacts"] = [str(ROOT / "scripts/test-pipeline.py")]
     project["privacy_detector_qualification"] = "build/detector-qualification.json"
     atomic_write_json(
         directory / project["privacy_detector_qualification"],
         {
             "version": 1,
             "parser_policy": "minimum-height-0.12-v1",
-            "detector": command_identity(detector_command, directory),
+            "detector": detector_command_identity(
+                detector_command, directory, project["privacy_detector_artifacts"]
+            ),
             "labels_sha256": "synthetic-labels",
             "inputs_sha256": "synthetic-inputs",
             "detections_sha256": "synthetic-detections",
