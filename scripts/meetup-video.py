@@ -561,8 +561,10 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
     )
     chapter_entries(project)
     disk_path = project_path(project, "final_output").parent
-    while not disk_path.exists():
+    while not disk_path.exists() and disk_path != disk_path.parent:
         disk_path = disk_path.parent
+    if not disk_path.exists():
+        raise SystemExit("final output volume is unavailable")
     free = shutil.disk_usage(disk_path).free
     final_resolution = project.get("final_resolution", "3840x2160")
     estimated_bitrate = 24_000_000 if final_resolution == "3840x2160" else 8_000_000

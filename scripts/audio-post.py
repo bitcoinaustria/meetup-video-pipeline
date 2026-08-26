@@ -75,6 +75,13 @@ def file_sha256(path: Path | None) -> str | None:
     return sha256_file(path) if path and path.exists() else None
 
 
+def manifest_path(path: Path, base: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(base.resolve()))
+    except ValueError:
+        return str(path.resolve())
+
+
 def probe_audio(video: Path) -> dict:
     data = json.loads(
         run(
@@ -140,13 +147,8 @@ def source_identity(
     duration: float | None,
     base: Path = ROOT,
 ) -> dict:
-    resolved = video.resolve()
-    try:
-        stored_path = str(resolved.relative_to(base))
-    except ValueError:
-        stored_path = str(resolved)
     return {
-        "path": stored_path,
+        "path": manifest_path(video, base),
         **content_fingerprint(video, base / "build/source-fingerprint.json"),
         "video_duration": video_duration,
         "audio": audio,
@@ -334,6 +336,7 @@ def transcribe_chunks(
     language: str,
     threads: int,
     refresh: bool,
+    project_dir: Path,
 ) -> tuple[list[dict], list[dict]]:
     with wave.open(str(wav_path), "rb") as audio:
         duration = audio.getnframes() / audio.getframerate()
@@ -356,7 +359,7 @@ def transcribe_chunks(
         files.append(
             {
                 "channel": channel,
-                "path": str(transcript.resolve()),
+                "path": manifest_path(transcript, project_dir),
                 "source_offset": chunk_offset,
                 "backend": backend,
             }
@@ -522,7 +525,7 @@ def transcribe_secondary_chunks(
             hint.update({"channel": channel, "source_offset": global_offset, "window": window_index})
         artifact = {
             "channel": channel,
-            "path": str(cache.resolve()),
+            "path": manifest_path(cache, Path(project["_project_dir"])),
             "source_offset": global_offset,
             "duration": round(window_duration, 3),
             "backend": backend,
@@ -1271,7 +1274,7 @@ def speaker_context(project: dict, source: dict) -> dict:
         "audience_intervals": audience,
         "speaker_boundaries": boundaries,
         "reviewed_turns": turns,
-        "source": str(reviewed) if reviewed and reviewed.exists() else None,
+        "source": manifest_path(reviewed, Path(project["_project_dir"])) if reviewed and reviewed.exists() else None,
         "source_sha256": file_sha256(reviewed),
         "coverage_valid": valid,
         "invalid_reason": None if valid else invalid_reason,
@@ -1778,6 +1781,7 @@ def analyze(args: argparse.Namespace) -> None:
             args.language,
             args.threads,
             analysis_changed,
+            Path(project["_project_dir"]),
         )
         transcript_files.extend(channel_transcripts)
         words_by_channel[channel] = channel_words
@@ -2045,6 +2049,7 @@ def self_test() -> None:
     time_map = build_time_map(10, approved)
     assert abs(time_map["source_duration"] - time_map["output_duration"] - time_map["removed_duration"]) < 1e-6
     with tempfile.TemporaryDirectory() as directory:
+        assert manifest_path(Path(directory) / "build/artifact.json", Path(directory)) == "build/artifact.json"
         for name, independent in (("dual", False), ("independent", True)):
             path = Path(directory) / f"{name}.wav"
             samples = array.array("h")

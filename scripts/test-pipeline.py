@@ -39,6 +39,19 @@ def make_mask(path: Path, color: str) -> None:
     )
 
 
+def sample_pixel(path: Path, x: int, y: int) -> tuple[int, int, int]:
+    frame = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "0.1", "-i", str(path),
+            "-vf", f"crop=2:2:{x}:{y},format=rgb24", "-frames:v", "1", "-f", "rawvideo", "-",
+        ],
+        check=True,
+        capture_output=True,
+    ).stdout
+    assert len(frame) == 12
+    return tuple(frame[:3])
+
+
 def fixture(directory: Path) -> Path:
     for name in (
         "source", "build/slides", "build/privacy", "build/faq-analysis/fixture/cards",
@@ -52,12 +65,15 @@ def fixture(directory: Path) -> Path:
 
     background = Image.new("RGB", (1920, 1080), "#171717")
     background.save(directory / "background.png")
-    slide = Image.new("RGB", (1920, 1080), "#f2f2f2")
+    slide = Image.new("RGB", (1920, 1080), "#df2020")
     draw = ImageDraw.Draw(slide)
     draw.rectangle((120, 120, 1800, 960), outline="#eb0028", width=20)
     draw.text((180, 180), "Synthetic pipeline", fill="black")
     slide.save(directory / "build/slides/page-01.jpg", quality=90)
     slide.save(directory / "source/slides.pdf", "PDF")
+    Image.new("RGB", (1920, 1080), "#20df20").save(
+        directory / "build/slides/page-02.jpg", quality=90
+    )
     card = Image.new("RGB", (1920, 1080), "#202020")
     ImageDraw.Draw(card).text((300, 500), "AUDIENCE QUESTION", fill="white")
     card.save(directory / "build/faq-analysis/fixture/cards/faq-01-full-cover.png")
@@ -71,8 +87,8 @@ def fixture(directory: Path) -> Path:
         directory / "build/timeline.json",
         {
             "duration": DURATION,
-            "website_until": 0.0,
-            "slides": [{"time": 0.0, "page": 1}],
+            "website_until": 0.5,
+            "slides": [{"time": 0.5, "page": 1}, {"time": 2.0, "page": 2}],
             "speaker_track": "build/speaker-track.json",
             "source_width": 3840,
             "speaker_crop": {"width": 1728, "height": 2160, "y": 0},
@@ -225,6 +241,13 @@ def main() -> None:
             "--input",
             str(project.parent / "output/debug/previews/preview-1080p.mp4"),
         )
+        late_preview = project.parent / "output/debug/previews/late-slide.mp4"
+        run(
+            *command, "preview", "--start", "2.5", "--duration", "1.5",
+            "--output", str(late_preview),
+        )
+        red, green, blue = sample_pixel(late_preview, 700, 400)
+        assert green > 180 and red < 80 and blue < 80, (red, green, blue)
         edl = project.parent / "final-edits.json"
         approved_edl = edl.read_bytes()
         edl.write_bytes(approved_edl + b" ")

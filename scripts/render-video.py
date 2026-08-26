@@ -458,9 +458,6 @@ def main() -> None:
         "-i", str(args.video),
         "-loop", "1", "-framerate", "30", "-i", str(args.background),
     ))
-    slide_seek = max(0.0, args.start - float(timeline["website_until"]))
-    if slide_seek:
-        command.extend(("-ss", f"{slide_seek:.6f}"))
     command.extend(("-safe", "0", "-f", "concat", "-i", str(concat)))
     if args.privacy_mask:
         mask_offset = args.start - args.privacy_mask_start
