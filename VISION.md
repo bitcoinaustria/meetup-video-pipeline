@@ -6,4 +6,4 @@ The operator supplies a camera recording, the digital slide deck, and a small pr
 
 Automation must fail safely. A visible bystander is worse than a briefly blurred camera, a wrong content cut is worse than a retained pause, and generated copy must stay grounded in the transcript and slides. Every automated decision should remain inspectable through timelines or edit lists, while normal operation should need only a preview approval and one production command.
 
-The current implementation is macOS-first. Cross-platform support is earned when Apple Vision detection and OCR have tested replacements; the FFmpeg render contract and JSON project data should remain platform-neutral in the meantime.
+The current implementation is macOS-first. Detection commands use a platform-neutral TSV contract, and replacements must pass the labeled any-person and overlapping-person recall gates before becoming defaults. The FFmpeg render contract and JSON project data remain platform-neutral in the meantime.

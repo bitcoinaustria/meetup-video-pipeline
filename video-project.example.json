@@ -29,6 +29,8 @@
   "faq_analyzer": "codex",
   "faq_card_duration": 7.5,
   "faq_card_min_answer_seconds": 12.0,
+  "faq_label": "FRAGE AUS DEM PUBLIKUM",
+  "faq_accent": "#eb0028",
   "privacy_mask": "build/privacy/mask.mp4",
   "full_blur_mask": "build/privacy/full-blur.mp4",
   "presentation_start": 0.0,
@@ -38,11 +40,13 @@
   "shorts_logo_opacity": 0.55,
   "caption_replacements": {},
   "final_output": "output/final/final-4k.mp4",
+  "final_metadata": "output/metadata/final-render.json",
   "final_resolution": "3840x2160",
   "publishing_copy": "output/metadata/publishing-copy.md",
   "chapters_output": "output/metadata/youtube-chapters.txt",
+  "chapters_enabled": true,
   "chapter_min_seconds": 180.0,
   "encoder": "libx264",
   "preview_preset": "ultrafast",
-  "final_preset": "ultrafast"
+  "final_preset": "slow"
 }

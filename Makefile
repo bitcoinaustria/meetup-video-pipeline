@@ -2,7 +2,7 @@ PYTHON := $(shell test -x .venv/bin/python && echo .venv/bin/python || echo pyth
 PROJECT ?= video-project.json
 RUN := $(PYTHON) scripts/meetup-video.py --project $(PROJECT)
 
-.PHONY: init check preview copy chapters audio faq shorts validate final release
+.PHONY: init check preview copy chapters audio faq shorts validate final release test
 
 init:
 	test -n "$(NAME)"
@@ -37,3 +37,16 @@ final:
 
 release:
 	$(RUN) release
+
+test:
+	$(PYTHON) -m py_compile scripts/*.py
+	$(PYTHON) scripts/audio-post.py self-test
+	$(PYTHON) scripts/build-faq.py --self-test
+	$(PYTHON) scripts/build-privacy-review.py --self-test
+	$(PYTHON) scripts/build-speaker-track.py self-test
+	$(PYTHON) scripts/render-video.py --self-test
+	$(PYTHON) scripts/render-shorts.py --self-test
+	$(PYTHON) scripts/test-privacy-safety.py
+	$(PYTHON) scripts/test-video-common.py
+	$(PYTHON) scripts/score-detections.py --self-test
+	$(PYTHON) scripts/test-pipeline.py

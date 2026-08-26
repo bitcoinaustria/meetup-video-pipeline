@@ -4,6 +4,8 @@ import argparse
 import json
 from pathlib import Path
 
+from video_common import atomic_write_json, atomic_write_text
+
 
 SMOOTH_WEIGHTS = (1, 4, 6, 4, 1)
 
@@ -25,9 +27,9 @@ def prepare(samples: Path, output: Path, step: float) -> None:
     frames = sorted(samples.glob("frame-*.jpg"))
     if not frames:
         raise SystemExit(f"no frames found in {samples}")
-    output.write_text(
+    atomic_write_text(
+        output,
         "".join(f"{index * step:.3f}\t{path.resolve()}\n" for index, path in enumerate(frames)),
-        encoding="utf-8",
     )
     print(f"{len(frames)} frames -> {output}")
 
@@ -93,7 +95,7 @@ def build(detections: Path, output: Path, source_width: int, crop_width: int) ->
                 value = max(lower, min(upper, value))
         item["x"] = round(value, 2)
 
-    output.write_text(json.dumps(positions, indent=2) + "\n", encoding="utf-8")
+    atomic_write_json(output, positions)
     print(f"{len(positions)} tracked positions -> {output}")
 
 
@@ -112,13 +114,16 @@ def main() -> None:
     track.add_argument("--source-width", type=int, default=3840)
     track.add_argument("--crop-width", type=int, default=1080)
 
+    subparsers.add_parser("self-test")
+
     args = parser.parse_args()
-    if args.command == "prepare":
+    if args.command == "self-test":
+        assert smooth_positions([10.0] * 9) == [10.0] * 9
+    elif args.command == "prepare":
         prepare(args.samples, args.output, args.step)
     else:
         build(args.detections, args.output, args.source_width, args.crop_width)
 
 
 if __name__ == "__main__":
-    assert smooth_positions([10.0] * 9) == [10.0] * 9
     main()
