@@ -182,6 +182,21 @@ def main() -> None:
         )
         initialized_project = json.loads(initialized.read_text(encoding="utf-8"))
         assert initialized_project["event_url"] == "https://example.com/events/meetup"
+        assert initialized_project["acceleration"] == "auto" and "encoder" not in initialized_project
+        capabilities = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/meetup-video.py"),
+                "--project",
+                str(initialized),
+                "capabilities",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        selected_encoder = json.loads(capabilities.stdout)["video_encoder"]["name"]
+        assert selected_encoder == "libx264" or selected_encoder.startswith("h264_")
         invalid = temporary_path / "invalid/project.json"
         rejected = subprocess.run(
             [

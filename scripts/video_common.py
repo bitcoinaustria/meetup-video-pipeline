@@ -4,12 +4,195 @@ import bisect
 import hashlib
 import json
 import os
+import platform
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+_HOST_CAPABILITY_CACHE: dict[str, dict] = {}
+
+
+def resource_budget(
+    jobs: int | None = None,
+    gpu_jobs: int | None = None,
+    render_jobs: int | None = None,
+) -> dict[str, int]:
+    cpus = max(1, os.cpu_count() or 1)
+    workers = jobs if jobs is not None else min(4, max(1, cpus // 2))
+    gpu_workers = gpu_jobs if gpu_jobs is not None else 1
+    render_workers = render_jobs if render_jobs is not None else 1
+    if min(workers, gpu_workers, render_workers) < 1:
+        raise SystemExit("jobs, gpu-jobs, and render-jobs must be positive")
+    return {
+        "cpus": cpus,
+        "jobs": workers,
+        "gpu_jobs": gpu_workers,
+        "render_jobs": render_workers,
+        "threads_per_job": max(1, cpus // workers),
+    }
+
+
+def encoder_candidates(system: str | None = None) -> list[str]:
+    system = system or platform.system()
+    if system == "Darwin":
+        return ["h264_videotoolbox"]
+    if system == "Windows":
+        return ["h264_nvenc", "h264_qsv", "h264_amf"]
+    if system == "Linux":
+        return ["h264_nvenc", "h264_qsv", "h264_amf"]
+    return []
+
+
+def encoder_options(encoder: str, preset: str | None = None) -> list[str]:
+    options = ["-c:v", encoder]
+    if preset and encoder in {"libx264", "libx265"}:
+        options.extend(("-preset", preset))
+    return options
+
+
+def _ffmpeg_version(ffmpeg: str) -> str:
+    result = subprocess.run(
+        [ffmpeg, "-version"], check=True, capture_output=True, text=True, timeout=10
+    )
+    return result.stdout.splitlines()[0]
+
+
+def _encoder_works(ffmpeg: str, encoder: str) -> tuple[bool, str]:
+    try:
+        result = subprocess.run(
+            [
+                ffmpeg,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=128x72:r=1:d=1",
+                "-frames:v",
+                "1",
+                "-an",
+                "-c:v",
+                encoder,
+                "-f",
+                "null",
+                "-",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return False, str(error)
+    detail = (result.stderr or "").strip().splitlines()
+    return result.returncode == 0, detail[-1] if detail else ""
+
+
+def _command_status(
+    command: object, default: Path | None = None, base: Path = ROOT
+) -> dict[str, object]:
+    configured = command[0] if isinstance(command, list) and command else command
+    executable = str(configured or default or "")
+    if not executable:
+        return {"available": False, "command": ""}
+    path = Path(executable)
+    local = path if path.is_absolute() else base / path
+    resolved = str(local.resolve()) if local.exists() else shutil.which(executable)
+    return {"available": bool(resolved), "command": resolved or executable}
+
+
+def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
+    project_dir = Path(project.get("_project_dir", ROOT))
+    output = project_dir / "build/host-capabilities.json"
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise SystemExit("ffmpeg is unavailable")
+    signature = {
+        "system": platform.system(),
+        "machine": platform.machine(),
+        "ffmpeg": ffmpeg,
+        "ffmpeg_version": _ffmpeg_version(ffmpeg),
+        "acceleration": str(project.get("acceleration", "auto")),
+        "requested_encoder": str(project.get("encoder", "auto")),
+        "privacy_detector_command": project.get(
+            "privacy_detector_command", project.get("people_detector")
+        ),
+        "ocr_command": project.get("ocr_command"),
+    }
+    cache_key = json.dumps(signature, ensure_ascii=False, sort_keys=True)
+    if not refresh and cache_key in _HOST_CAPABILITY_CACHE:
+        return _HOST_CAPABILITY_CACHE[cache_key]
+
+    policy = signature["acceleration"]
+    if policy not in {"auto", "off", "required"}:
+        raise SystemExit("acceleration must be auto, off, or required")
+    requested = signature["requested_encoder"]
+    candidates = (
+        [requested]
+        if requested != "auto"
+        else ([] if policy == "off" else encoder_candidates(signature["system"])) + ["libx264"]
+    )
+    probes = []
+    selected = None
+    for encoder in candidates:
+        works, detail = _encoder_works(ffmpeg, encoder)
+        probes.append({"encoder": encoder, "available": works, "detail": detail})
+        if works:
+            selected = encoder
+            break
+    if not selected:
+        raise SystemExit(f"no usable FFmpeg H.264 encoder found: {', '.join(candidates)}")
+    hardware = selected != "libx264"
+    if policy == "required" and not hardware:
+        raise SystemExit("hardware acceleration is required but no supported encoder passed its smoke test")
+    if requested != "auto" and selected != requested:
+        raise SystemExit(f"requested encoder is unavailable: {requested}")
+
+    default_people = ROOT / "scripts/vision-people.swift" if signature["system"] == "Darwin" else None
+    default_ocr = ROOT / "scripts/vision-ocr.swift" if signature["system"] == "Darwin" else None
+    profile = {
+        "version": 1,
+        "signature": signature,
+        "video_encoder": {"name": selected, "hardware": hardware, "probes": probes},
+        "privacy_detector": _command_status(
+            project.get("privacy_detector_command", project.get("people_detector")),
+            default_people,
+            project_dir,
+        ),
+        "ocr": _command_status(project.get("ocr_command"), default_ocr, project_dir),
+    }
+    atomic_write_json(output, profile)
+    _HOST_CAPABILITY_CACHE[cache_key] = profile
+    return profile
+
+
+def privacy_detector_command(project: dict) -> list[str]:
+    import shlex
+
+    configured = project.get("privacy_detector_command", project.get("people_detector"))
+    if configured:
+        command = list(configured) if isinstance(configured, list) else shlex.split(str(configured))
+    elif platform.system() == "Darwin":
+        command = [str(ROOT / "scripts/vision-people.swift"), "--list", "{inputs}", "--output", "{output}"]
+    else:
+        raise SystemExit(
+            "no qualified privacy detector is configured on this platform; "
+            "set privacy_detector_command to a detector that implements the TSV contract"
+        )
+    if not any("{inputs}" in item for item in command) or not any(
+        "{output}" in item for item in command
+    ):
+        raise SystemExit("privacy_detector_command must contain {inputs} and {output} placeholders")
+    executable = Path(command[0])
+    local = executable if executable.is_absolute() else Path(project.get("_project_dir", ROOT)) / executable
+    if local.exists():
+        command[0] = str(local.resolve())
+    elif not shutil.which(command[0]):
+        raise SystemExit(f"privacy detector is unavailable: {command[0]}")
+    return command
 
 
 def resolve_project_path(project: dict, value: str) -> Path:

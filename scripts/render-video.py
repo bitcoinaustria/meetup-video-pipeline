@@ -8,6 +8,7 @@ from pathlib import Path
 
 from video_common import (
     atomic_write_text,
+    encoder_options,
     ffconcat_quote,
     monotone_slopes,
     resolve_project_path,
@@ -476,13 +477,9 @@ def main() -> None:
     command.extend((
         "-filter_complex", filter_graph,
         "-map", video_map, "-map", audio_map,
-        "-c:v", args.encoder,
     ))
-    if args.encoder.endswith("_videotoolbox"):
-        command.extend(("-allow_sw", "1"))
+    command.extend(encoder_options(args.encoder, args.preset))
     command.extend(("-b:v", bitrate, "-maxrate", maxrate, "-bufsize", bufsize))
-    if args.preset:
-        command.extend(("-preset", args.preset))
     command.extend((
         "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
         "-c:a", "aac" if cuts or faq_entries or audio_label else "copy",

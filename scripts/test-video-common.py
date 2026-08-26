@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
+import platform
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -8,8 +10,12 @@ from video_common import (
     build_time_map,
     configured_analyzer,
     content_fingerprint,
+    encoder_candidates,
+    encoder_options,
     event_context,
     ffconcat_quote,
+    privacy_detector_command,
+    resource_budget,
     source_range_output_duration,
     source_to_output,
     timeline_events_in_range,
@@ -27,6 +33,21 @@ assert timeline_events_in_range(11.5, 1, edits, faq) == ["cut 12.000-13.000"]
 assert timeline_events_in_range(14, 1, edits, faq) == []
 assert build_time_map(3, [{"source_start": 1, "source_end": 2}])["output_duration"] == 2
 assert configured_analyzer({"analyzer": "codex"}, "audio") == "codex"
+assert encoder_candidates("Darwin") == ["h264_videotoolbox"]
+assert encoder_candidates("Linux")[0] == "h264_nvenc"
+assert encoder_options("h264_nvenc", "ultrafast") == ["-c:v", "h264_nvenc"]
+assert encoder_options("libx264", "slow") == ["-c:v", "libx264", "-preset", "slow"]
+assert resource_budget(4, 1, 1)["threads_per_job"] >= 1
+detector = [sys.executable, "detector.py", "{inputs}", "{output}"]
+resolved_detector = privacy_detector_command({"privacy_detector_command": detector})
+assert Path(resolved_detector[0]).samefile(sys.executable) and resolved_detector[1:] == detector[1:]
+if platform.system() != "Darwin":
+    try:
+        privacy_detector_command({})
+    except SystemExit as error:
+        assert "no qualified privacy detector" in str(error)
+    else:
+        raise AssertionError("non-macOS privacy detection must fail closed")
 assert configured_analyzer(
     {"analyzer": "codex", "audio_analyzer": "claude"}, "audio"
 ) == "claude"

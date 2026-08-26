@@ -23,8 +23,10 @@ from video_common import (
     canonical_sha256,
     configured_analyzer,
     content_fingerprint,
+    encoder_options,
     event_context,
     ffconcat_quote,
+    host_capabilities,
     file_sha256 as sha256_file,
     optional_project_path,
     read_prompt_source,
@@ -426,6 +428,7 @@ def transcribe_secondary_chunks(
     output_dir: Path,
     language: str,
     source_offset: float,
+    workers: int,
 ) -> tuple[list[dict], list[dict], dict]:
     settings = project.get("audio_secondary_transcriber", {})
     if not settings.get("enabled", False):
@@ -529,7 +532,7 @@ def transcribe_secondary_chunks(
     all_hints = []
     artifacts = []
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(jobs) or 1)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(jobs) or 1)) as executor:
             results = list(executor.map(transcribe_window, jobs))
     except SystemExit:
         raise
@@ -1405,7 +1408,7 @@ def semantic_confidence_threshold(decision: dict) -> float:
 
 
 def semantic_review(
-    decisions: list[dict], project: dict, output: Path, provider: str, source: dict
+    decisions: list[dict], project: dict, output: Path, provider: str, source: dict, workers: int
 ) -> dict:
     candidates = [decision for decision in decisions if decision["auto_eligible"]]
     candidate_file = output / "semantic-candidates.json"
@@ -1526,7 +1529,7 @@ right_quiet interval, and the proposed cut deliberately ends inside that quiet i
         if provider not in {"claude", "codex"}:
             raise SystemExit(f"unsupported audio semantic analyzer: {provider}")
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(batches) or 1)) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(batches) or 1)) as executor:
                 reviewed_batches = list(executor.map(review_batch, enumerate(batches, 1)))
             analysis = {"decisions": [item for batch in reviewed_batches for item in batch]}
             analysis["decisions"].sort(key=lambda item: item["id"])
@@ -1610,7 +1613,9 @@ def write_review(edl: dict, output: Path) -> None:
     atomic_write_text(output, "\n".join(lines) + "\n")
 
 
-def make_review_clips(video: Path, decisions: list[dict], output_dir: Path, limit: int) -> None:
+def make_review_clips(
+    video: Path, decisions: list[dict], output_dir: Path, limit: int, encoder: str
+) -> None:
     clips = output_dir / "review-clips"
     clips.mkdir(parents=True, exist_ok=True)
     selected = decisions[:limit]
@@ -1623,6 +1628,7 @@ def make_review_clips(video: Path, decisions: list[dict], output_dir: Path, limi
             [item["id"], item["source_start"], item["source_end"]]
             for item in selected
         ],
+        "encoder": encoder,
     }
     expected = [clips / f"{item['id']}.mp4" for item in selected]
     try:
@@ -1631,7 +1637,6 @@ def make_review_clips(video: Path, decisions: list[dict], output_dir: Path, limi
         cached_identity = None
     if cached_identity == identity and montage.exists() and all(path.exists() for path in expected):
         return
-    hardware = True
     outputs = []
     for decision in selected:
         start = max(0, decision["source_start"] - 3)
@@ -1653,15 +1658,16 @@ def make_review_clips(video: Path, decisions: list[dict], output_dir: Path, limi
             "-vf",
             "scale=1920:-2",
         ]
-        ending = ["-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output)]
-        if hardware:
-            try:
-                run([*common, "-c:v", "h264_videotoolbox", "-allow_sw", "1", "-b:v", "7M", *ending])
-                continue
-            except subprocess.CalledProcessError:
-                hardware = False
-                output.unlink(missing_ok=True)
-        run([*common, "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", *ending])
+        encoding = encoder_options(encoder, "ultrafast")
+        if encoder == "libx264":
+            encoding.extend(("-crf", "23"))
+        else:
+            encoding.extend(("-b:v", "7M"))
+        run([
+            *common,
+            *encoding,
+            "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
+        ])
     if outputs:
         concat = clips / "clips.ffconcat"
         atomic_write_text(
@@ -1697,8 +1703,11 @@ def make_review_clips(video: Path, decisions: list[dict], output_dir: Path, limi
 
 
 def analyze(args: argparse.Namespace) -> None:
+    if min(args.threads, args.jobs, args.gpu_jobs) < 1:
+        raise SystemExit("threads, jobs, and gpu-jobs must be positive")
     project = json.loads(args.project.read_text(encoding="utf-8"))
     project["_project_dir"] = str(args.project.resolve().parent)
+    encoder = host_capabilities(project)["video_encoder"]["name"]
     args.video = args.video or project_path(project, "video")
     args.timeline = args.timeline or project_path(project, "timeline")
     args.output = args.output or Path(project["_project_dir"]) / "build/audio-post"
@@ -1783,7 +1792,7 @@ def analyze(args: argparse.Namespace) -> None:
     )
     fine_quiet_intervals = [(start + args.start, end + args.start) for start, end in fine_quiet_intervals]
     secondary_hints, secondary_transcripts, secondary_detector = transcribe_secondary_chunks(
-        project, channel_wavs, words_by_channel, args.output, args.language, args.start
+        project, channel_wavs, words_by_channel, args.output, args.language, args.start, args.gpu_jobs
     )
     hidden_decisions = hidden_disfluency_decisions(
         secondary_hints, words_by_channel, quiet_intervals
@@ -1812,7 +1821,12 @@ def analyze(args: argparse.Namespace) -> None:
     for index, decision in enumerate(decisions, 1):
         decision["id"] = f"audio-{index:04d}"
     semantic = semantic_review(
-        decisions, project, args.output, configured_analyzer(project, "audio", args.analyzer), identity
+        decisions,
+        project,
+        args.output,
+        configured_analyzer(project, "audio", args.analyzer),
+        identity,
+        args.jobs,
     )
 
     edl = {
@@ -1897,7 +1911,7 @@ def analyze(args: argparse.Namespace) -> None:
             decisions,
             key=lambda item: (not item["auto_eligible"], item["source_start"]),
         )
-        make_review_clips(args.video, review_decisions, args.output, args.review_clips)
+        make_review_clips(args.video, review_decisions, args.output, args.review_clips, encoder)
     print(json.dumps(edl["summary"], indent=2))
 
 
@@ -2053,6 +2067,8 @@ def main() -> None:
     analyze_parser.set_defaults(refine_fillers=True)
     analyze_parser.add_argument("--language", default="de")
     analyze_parser.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1))
+    analyze_parser.add_argument("--jobs", type=int, default=3)
+    analyze_parser.add_argument("--gpu-jobs", type=int, default=1)
     analyze_parser.add_argument("--silence-db", type=float, default=-40)
     analyze_parser.add_argument("--start", type=float, default=0.0)
     analyze_parser.add_argument("--duration", type=float)

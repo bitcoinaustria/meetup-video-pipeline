@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -11,8 +12,10 @@ from video_common import (
     atomic_write_json,
     atomic_write_text,
     content_fingerprint,
+    encoder_options,
     ffconcat_quote,
     file_sha256,
+    host_capabilities,
     project_path,
     source_to_output,
     timeline_events_in_range,
@@ -68,7 +71,7 @@ def transcribe(video: Path, start: float, duration: float, work: Path, project: 
     temporary = transcript.with_name(f".{transcript.stem}.tmp{transcript.suffix}")
     prefix = temporary.with_suffix("")
     command = [
-        str(WHISPER), "--threads", str(project.get("audio_threads", max(1, os.cpu_count() or 1))),
+        str(WHISPER), "--threads", str(project.get("audio_threads", project["_audio_threads"])),
         "--beam-size", "1", "--best-of", "1",
         "--model", str(WHISPER_MODEL), "--file", str(wav),
         "--language", language,
@@ -244,13 +247,16 @@ def render_clip(
     mask_offset = source_start - float(project["presentation_start"])
     private_video = clip_build / "private.mp4"
     normalized_audio = clip_build / "normalized.m4a"
+    encoder = project["_video_encoder"]
+    encoding = encoder_options(encoder, "ultrafast")
+    encoding.extend(("-crf", "18") if encoder == "libx264" else ("-b:v", "20M"))
     run([
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
         "-ss", f"{source_start:.3f}", "-i", str(raw_video),
         "-ss", f"{mask_offset:.3f}", "-i", str(privacy_mask),
         "-ss", f"{mask_offset:.3f}", "-i", str(full_blur_mask),
         "-filter_complex", privacy_graph, "-map", "[outv]", "-t", f"{duration:.3f}", "-an",
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+        *encoding,
         "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
         "-movflags", "+faststart", str(private_video),
     ])
@@ -270,7 +276,7 @@ def render_clip(
             f"colorchannelmixer=aa={float(project.get('shorts_logo_opacity', 0.55)):.3f}[mark];"
             "[0:v][mark]overlay=96:96:eof_action=pass[outv]",
             "-map", "[outv]", "-map", "1:a:0", "-t", f"{duration:.3f}",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+            *encoding,
             "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
             "-c:a", "copy", "-movflags", "+faststart", str(temporary_output),
         ])
@@ -287,6 +293,8 @@ def main() -> None:
     parser.add_argument("--project", type=Path, default=ROOT / "video-project.json")
     parser.add_argument("--manifest", type=Path, default=ROOT / "shorts.json")
     parser.add_argument("--only", action="append", help="Render only the named clip; may be repeated.")
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--threads", type=int, default=max(1, os.cpu_count() or 1))
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -295,6 +303,10 @@ def main() -> None:
 
     project = json.loads(args.project.read_text(encoding="utf-8"))
     project["_project_dir"] = str(args.project.resolve().parent)
+    if min(args.jobs, args.threads) < 1:
+        raise SystemExit("jobs and threads must be positive")
+    project["_audio_threads"] = args.threads
+    project["_video_encoder"] = host_capabilities(project)["video_encoder"]["name"]
     global WHISPER, WHISPER_MODEL
     if project.get("whisper_binary"):
         WHISPER = project_path(project, "whisper_binary")
@@ -350,14 +362,16 @@ def main() -> None:
     clips = [clip for clip in manifest["clips"] if not args.only or clip["id"] in args.only]
     if not clips:
         raise SystemExit("no matching clips")
-    outputs = []
-    for clip in clips:
+    def render_one(clip: dict) -> Path:
         output = output_dir / f"{clip['id']}.mp4"
         render_clip(
             raw_video, final_video, logo_source, privacy_mask, full_blur_mask,
             clip, project, output, build,
         )
-        outputs.append(output)
+        return output
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.jobs, len(clips))) as executor:
+        outputs = list(executor.map(render_one, clips))
 
     concat = build / "review.ffconcat"
     atomic_write_text(

@@ -223,7 +223,6 @@ def ensure_transcript(
     prefix = temporary.with_suffix("")
     command = [
         str(WHISPER),
-        "--no-gpu",
         "--threads",
         str(WHISPER_THREADS),
         "--beam-size",
@@ -244,7 +243,11 @@ def ensure_transcript(
         str(prefix),
     ]
     try:
-        run(command)
+        try:
+            run(command)
+        except RuntimeError:
+            temporary.unlink(missing_ok=True)
+            run([command[0], "--no-gpu", *command[1:]])
         temporary.replace(path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -797,9 +800,12 @@ def write_outputs(
 
 
 def main() -> None:
+    global WHISPER, WHISPER_MODEL, WHISPER_THREADS, MAX_ANALYSIS_WORKERS
     parser = argparse.ArgumentParser(description="Build complete audience FAQ edits from transcript and audio level.")
     parser.add_argument("--project", type=Path, default=ROOT / "video-project.json")
     parser.add_argument("--analyzer")
+    parser.add_argument("--jobs", type=int, default=MAX_ANALYSIS_WORKERS)
+    parser.add_argument("--threads", type=int)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -807,14 +813,16 @@ def main() -> None:
         self_test()
         return
 
-    global WHISPER, WHISPER_MODEL, WHISPER_THREADS
     project = json.loads(args.project.read_text(encoding="utf-8"))
     project["_project_dir"] = str(args.project.resolve().parent)
     if project.get("whisper_binary"):
         WHISPER = resolve_project_path(project, project["whisper_binary"])
     if project.get("whisper_model"):
         WHISPER_MODEL = resolve_project_path(project, project["whisper_model"])
-    WHISPER_THREADS = int(project.get("audio_threads", WHISPER_THREADS))
+    if min(args.jobs, args.threads or 1) < 1:
+        raise SystemExit("jobs and threads must be positive")
+    MAX_ANALYSIS_WORKERS = args.jobs
+    WHISPER_THREADS = int(args.threads or project.get("audio_threads", WHISPER_THREADS))
     video = resolve_project_path(project, project["video"])
     source_duration = duration(video)
     scan_start = float(project.get("faq_scan_start", project["presentation_start"]))

@@ -4,7 +4,6 @@ import argparse
 import json
 import math
 import os
-import shlex
 import shutil
 import subprocess
 import sys
@@ -15,7 +14,14 @@ from statistics import median
 
 from PIL import Image, ImageDraw, ImageStat
 
-from video_common import atomic_write_json, atomic_write_text, ffconcat_quote, resolve_project_path
+from video_common import (
+    atomic_write_json,
+    atomic_write_text,
+    ffconcat_quote,
+    host_capabilities,
+    privacy_detector_command,
+    resolve_project_path,
+)
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -339,20 +345,7 @@ def main() -> None:
             "output/debug/privacy/problemstellen-privacy-test-1080p.mp4",
         ),
     )
-    configured_detector = project.get("privacy_detector_command", project.get("people_detector"))
-    detector_command = (
-        configured_detector
-        if isinstance(configured_detector, list)
-        else shlex.split(configured_detector)
-        if configured_detector
-        else [
-            str(ROOT / "scripts/vision-people.swift"),
-            "--list",
-            "{inputs}",
-            "--output",
-            "{output}",
-        ]
-    )
+    detector_command = privacy_detector_command(project)
     detector_path = Path(detector_command[0])
     if not detector_path.is_absolute() and (base / detector_path).exists():
         detector_command[0] = str((base / detector_path).resolve())
@@ -369,6 +362,7 @@ def main() -> None:
     replacements: list[tuple[float, list[tuple[float, Box | None]]]] = []
     masks: list[Path] = []
     cuts: list[Path] = []
+    encoder = host_capabilities(project)["video_encoder"]["name"]
 
     for index, (start, end) in enumerate(windows, 1):
         window_dir = build / f"window-{index:02d}"
@@ -402,7 +396,7 @@ def main() -> None:
             sys.executable, str(ROOT / "scripts/render-video.py"), "--video", str(args.video),
             "--project-dir", str(base),
             "--timeline", str(review_timeline), "--start", f"{start:.3f}", "--duration", f"{end - start:.3f}",
-            "--privacy-mask", str(mask), "--resolution", "1920x1080", "--encoder", "libx264",
+            "--privacy-mask", str(mask), "--resolution", "1920x1080", "--encoder", encoder,
             "--full-blur-mask", str(cut), "--privacy-mask-start", f"{start:.3f}",
             "--preset", "ultrafast", "--output", str(clip),
         ]

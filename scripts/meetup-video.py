@@ -20,10 +20,12 @@ from video_common import (
     content_fingerprint,
     event_context,
     file_sha256,
+    host_capabilities,
     optional_project_path,
     project_path,
     read_prompt_source,
     resolve_project_path,
+    resource_budget,
     run_structured_model,
     source_range_output_duration,
     source_to_output,
@@ -280,9 +282,17 @@ def render_identity(project: dict) -> dict:
         fingerprint(f"faq-card-{index:03d}", resolve_project_path(project, entry["image"]))
         for index, entry in enumerate(faq, 1)
     ]
+    profile = host_capabilities(project)
     identity = {
         "version": 1,
         "presentation_start": float(project["presentation_start"]),
+        "render": {
+            "resolution": project.get("final_resolution", "3840x2160"),
+            "encoder": profile["video_encoder"]["name"],
+            "ffmpeg": profile["signature"]["ffmpeg_version"],
+            "preview_preset": project.get("preview_preset", "ultrafast"),
+            "final_preset": project.get("final_preset", "slow"),
+        },
         "files": files,
     }
     return {**identity, "sha256": canonical_sha256(identity)}
@@ -558,7 +568,14 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
     estimated_bitrate = 24_000_000 if final_resolution == "3840x2160" else 8_000_000
     estimated_output = expected * estimated_bitrate / 8
     required_free = max(6 * GIB, estimated_output * 1.35)
-    print(f"inputs and privacy checks passed; free disk: {free / GIB:.1f} GiB")
+    profile = host_capabilities(project)
+    detector = profile["privacy_detector"]
+    print(
+        "inputs and privacy checks passed; "
+        f"encoder: {profile['video_encoder']['name']}; "
+        f"privacy detector: {'available' if detector['available'] else 'not installed'}; "
+        f"free disk: {free / GIB:.1f} GiB"
+    )
     if final and free < required_free:
         raise SystemExit(
             f"final render needs about {required_free / GIB:.1f} GiB free; "
@@ -591,6 +608,8 @@ def render(
         audio_policy = json.loads(audio_edits.read_text(encoding="utf-8")).get(
             "channel_analysis", {}
         ).get("render_policy", audio_policy)
+    encoder = host_capabilities(project)["video_encoder"]["name"]
+    preset = project.get("final_preset" if final else "preview_preset", "ultrafast")
     command = [
         sys.executable,
         str(ROOT / "scripts/render-video.py"),
@@ -619,14 +638,14 @@ def render(
         "--resolution",
         resolution,
         "--encoder",
-        project.get("encoder", "libx264"),
-        "--preset",
-        project.get("final_preset" if final else "preview_preset", "ultrafast"),
+        encoder,
         "--audio-policy",
         audio_policy,
         "--output",
         str(output),
     ]
+    if encoder in {"libx264", "libx265"} and preset:
+        command.extend(("--preset", str(preset)))
     if render_duration is not None:
         command.extend(("--duration", str(render_duration)))
     subprocess.run(command, check=True)
@@ -680,6 +699,7 @@ def final_render(project: dict, project_file: Path) -> None:
                 "output": project["final_output"],
                 "resolution": project.get("final_resolution", "3840x2160"),
                 "duration": round(seconds, 6),
+                "host": host_capabilities(project),
                 "artifact": artifact,
             },
         )
@@ -770,14 +790,25 @@ Do not use markdown inside the three values.
     print(output)
 
 
-def build_faq(project_file: Path, analyzer: str | None = None) -> None:
-    command = [sys.executable, str(ROOT / "scripts/build-faq.py"), "--project", str(project_file)]
+def build_faq(project: dict, project_file: Path, analyzer: str | None = None) -> None:
+    resources = project["_resources"]
+    command = [
+        sys.executable,
+        str(ROOT / "scripts/build-faq.py"),
+        "--project",
+        str(project_file),
+        "--jobs",
+        str(resources["jobs"]),
+        "--threads",
+        str(project.get("audio_threads", resources["cpus"])),
+    ]
     if analyzer:
         command.extend(("--analyzer", analyzer))
     subprocess.run(command, check=True)
 
 
 def build_audio(project: dict, project_file: Path, analyzer: str | None = None) -> None:
+    resources = project["_resources"]
     command = [
         sys.executable,
         str(ROOT / "scripts/audio-post.py"),
@@ -791,7 +822,11 @@ def build_audio(project: dict, project_file: Path, analyzer: str | None = None) 
         "--language",
         str(project.get("language", "de")),
         "--threads",
-        str(project.get("audio_threads", max(1, os.cpu_count() or 1))),
+        str(project.get("audio_threads", resources["cpus"])),
+        "--jobs",
+        str(resources["jobs"]),
+        "--gpu-jobs",
+        str(resources["gpu_jobs"]),
     ]
     if analyzer:
         command.extend(("--analyzer", analyzer))
@@ -807,6 +842,7 @@ def build_audio(project: dict, project_file: Path, analyzer: str | None = None) 
 
 def render_shorts(project: dict, project_file: Path) -> None:
     manifest = project_path(project, "shorts_manifest")
+    resources = project["_resources"]
     subprocess.run(
         [
             sys.executable,
@@ -815,6 +851,10 @@ def render_shorts(project: dict, project_file: Path) -> None:
             str(project_file),
             "--manifest",
             str(manifest),
+            "--jobs",
+            str(resources["render_jobs"]),
+            "--threads",
+            str(resources["threads_per_job"]),
         ],
         check=True,
     )
@@ -824,10 +864,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="One-command meetup video workflow.")
     parser.add_argument("--project", type=Path, default=ROOT / "video-project.json")
     parser.add_argument("--analyzer")
+    parser.add_argument("--jobs", type=int)
+    parser.add_argument("--gpu-jobs", type=int)
+    parser.add_argument("--render-jobs", type=int)
     subparsers = parser.add_subparsers(dest="command", required=True)
     init = subparsers.add_parser("init")
     init.add_argument("--name", required=True)
     init.add_argument("--event-url")
+    subparsers.add_parser("capabilities")
     subparsers.add_parser("check")
     preview = subparsers.add_parser("preview")
     preview.add_argument("--start", type=float)
@@ -848,8 +892,12 @@ def main() -> None:
         init_project(args.project, args.name, args.event_url or "")
         return
     project = load_project(args.project)
+    project["_resources"] = resource_budget(args.jobs, args.gpu_jobs, args.render_jobs)
 
-    if args.command == "check":
+    if args.command == "capabilities":
+        profile = host_capabilities(project, refresh=True)
+        print(json.dumps({**profile, "resources": project["_resources"]}, indent=2))
+    elif args.command == "check":
         check(project, args.project)
     elif args.command == "preview":
         start = args.start if args.start is not None else float(project["presentation_start"])
@@ -880,7 +928,7 @@ def main() -> None:
         build_audio(project, args.project, args.analyzer)
     elif args.command == "faq":
         build_audio(project, args.project, args.analyzer)
-        build_faq(args.project, args.analyzer)
+        build_faq(project, args.project, args.analyzer)
     elif args.command == "shorts":
         render_shorts(project, args.project)
     elif args.command == "validate":
@@ -891,7 +939,7 @@ def main() -> None:
     else:
         if project.get("rebuild_analysis_before_final", True):
             build_audio(project, args.project, args.analyzer)
-            build_faq(args.project, args.analyzer)
+            build_faq(project, args.project, args.analyzer)
         if args.command == "release":
             publishing_copy(project, args.project, args.analyzer)
         final_render(project, args.project)
