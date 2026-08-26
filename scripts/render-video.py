@@ -279,10 +279,17 @@ def main() -> None:
     person = timeline["speaker_crop"]
     screen = timeline["screen_crop"]
     output_width, output_height = map(int, args.resolution.split("x"))
-    scale = output_width / 3840
+    source_width = float(timeline.get("source_width", 3840))
+    if source_width <= 0:
+        raise SystemExit("timeline source_width must be positive")
+    layout_scale = output_width / 3840
+    source_scale = output_width / source_width
 
-    def scaled(value: int) -> int:
-        return round(value * scale)
+    def layout_scaled(value: int) -> int:
+        return round(value * layout_scale)
+
+    def source_scaled(value: int) -> int:
+        return round(value * source_scale)
 
     render_duration = args.duration if args.duration is not None else float(timeline["duration"]) - args.start
     edits = load_edits(args.edl, args.video, args.project_dir)
@@ -300,7 +307,7 @@ def main() -> None:
         commands,
         args.start,
         render_duration,
-        scale,
+        source_scale,
     )
     slide_offset = float(timeline["website_until"]) - args.start
     slide_enable = max(0.0, slide_offset)
@@ -335,20 +342,20 @@ def main() -> None:
     stage = (
         privacy
         + f"{source}split=3[person0][screen0][clock0];"
-        f"[person0]sendcmd=f={commands.name},crop@speaker={scaled(person['width'])}:{scaled(person['height'])}:{initial_x:.2f}:{scaled(person['y'])},"
-        f"scale={scaled(864)}:{scaled(1536)}:flags=lanczos[person];"
-        f"[screen0]crop={scaled(screen['width'])}:{scaled(screen['height'])}:{scaled(screen['x'])}:{scaled(screen['y'])},"
-        f"scale={scaled(2730)}:{scaled(1536)}:flags=lanczos[screen];"
+        f"[person0]sendcmd=f={commands.name},crop@speaker={source_scaled(person['width'])}:{source_scaled(person['height'])}:{initial_x:.2f}:{source_scaled(person['y'])},"
+        f"scale={layout_scaled(864)}:{layout_scaled(1536)}:flags=lanczos[person];"
+        f"[screen0]crop={source_scaled(screen['width'])}:{source_scaled(screen['height'])}:{source_scaled(screen['x'])}:{source_scaled(screen['y'])},"
+        f"scale={layout_scaled(2730)}:{layout_scaled(1536)}:flags=lanczos[screen];"
         f"[1:v]scale={output_width}:{output_height},format=yuv420p[background];"
         # Keep the camera's frame clock. A looped 30 fps background as the
         # overlay main duplicates frames when phone timestamps briefly drift.
         f"[clock0][background]blend=all_expr=B[canvas];"
-        f"[canvas][person]overlay={scaled(91)}:{scaled(296)}[stage1];"
-        f"[stage1][screen]overlay={scaled(1019)}:{scaled(296)}[stage2];"
+        f"[canvas][person]overlay={layout_scaled(91)}:{layout_scaled(296)}[stage1];"
+        f"[stage1][screen]overlay={layout_scaled(1019)}:{layout_scaled(296)}[stage2];"
     )
     slides_filter = (
-        f"[2:v]scale={scaled(2730)}:{scaled(1536)}:flags=lanczos,setpts=PTS+{slide_offset:.6f}/TB[slides];"
-        f"[stage2][slides]overlay={scaled(1019)}:{scaled(296)}:eof_action=pass:enable='gte(t,{slide_enable:.6f})'[outv]"
+        f"[2:v]scale={layout_scaled(2730)}:{layout_scaled(1536)}:flags=lanczos,setpts=PTS+{slide_offset:.6f}/TB[slides];"
+        f"[stage2][slides]overlay={layout_scaled(1019)}:{layout_scaled(296)}:eof_action=pass:enable='gte(t,{slide_enable:.6f})'[outv]"
     )
     filter_graph = stage + slides_filter
     video_label = "outv"
@@ -475,6 +482,7 @@ def main() -> None:
         "-map", video_map, "-map", audio_map,
     ))
     command.extend(encoder_options(args.encoder, args.preset))
+    command.extend(("-enc_time_base:v", "1:30"))
     command.extend(("-b:v", bitrate, "-maxrate", maxrate, "-bufsize", bufsize))
     command.extend((
         "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",

@@ -19,6 +19,7 @@ from video_common import (
     atomic_write_text,
     ffconcat_quote,
     host_capabilities,
+    parse_detection_coordinates,
     privacy_detector_command,
     resolve_project_path,
 )
@@ -54,11 +55,7 @@ def run(command: list[str]) -> None:
 
 
 def parse_boxes(encoded: str) -> list[Box]:
-    boxes = []
-    for item in encoded.split(";"):
-        if item:
-            boxes.append(Box(*map(float, item.split(","))))
-    return [box for box in boxes if box.height >= 0.12]
+    return [Box(*coordinates) for coordinates in parse_detection_coordinates(encoded)]
 
 
 def read_detections(path: Path) -> list[tuple[float, list[Box]]]:

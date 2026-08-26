@@ -8,7 +8,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
-from video_common import atomic_write_json, atomic_write_text
+from video_common import atomic_write_json, atomic_write_text, command_identity
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,10 +30,18 @@ def make_video(path: Path) -> None:
     )
 
 
-def make_mask(path: Path, color: str) -> None:
-    run(
+def make_mask(path: Path, color: str, white_interval: tuple[float, float] | None = None) -> None:
+    command = [
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
         "-f", "lavfi", "-i", f"color={color}:size=960x540:rate=30:duration={DURATION}",
+    ]
+    if white_interval:
+        command.extend((
+            "-vf",
+            f"negate=enable=between(t\\,{white_interval[0]}\\,{white_interval[1]})",
+        ))
+    run(
+        *command,
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-pix_fmt", "yuv420p",
         str(path),
     )
@@ -90,9 +98,10 @@ def fixture(directory: Path) -> Path:
             "website_until": 0.5,
             "slides": [{"time": 0.5, "page": 1}, {"time": 2.0, "page": 2}],
             "speaker_track": "build/speaker-track.json",
-            "source_width": 3840,
-            "speaker_crop": {"width": 1728, "height": 2160, "y": 0},
-            "screen_crop": {"x": 0, "y": 0, "width": 3840, "height": 2160},
+            "source_width": 1920,
+            "source_height": 1080,
+            "speaker_crop": {"width": 864, "height": 1080, "y": 0},
+            "screen_crop": {"x": 0, "y": 0, "width": 1920, "height": 1080},
         },
     )
     atomic_write_json(
@@ -175,6 +184,26 @@ def fixture(directory: Path) -> Path:
         "preview_preset": "ultrafast",
         "final_preset": "ultrafast",
     }
+    detector_command = [
+        sys.executable,
+        str(ROOT / "scripts/test-pipeline.py"),
+        "{inputs}",
+        "{output}",
+    ]
+    project["privacy_detector_command"] = detector_command
+    project["privacy_detector_qualification"] = "build/detector-qualification.json"
+    atomic_write_json(
+        directory / project["privacy_detector_qualification"],
+        {
+            "version": 1,
+            "parser_policy": "minimum-height-0.12-v1",
+            "detector": command_identity(detector_command, directory),
+            "labels_sha256": "synthetic-labels",
+            "inputs_sha256": "synthetic-inputs",
+            "detections_sha256": "synthetic-detections",
+            "metrics": {"any_person_recall": 1.0, "overlap_recall": 1.0},
+        },
+    )
     project_file = directory / "project.json"
     atomic_write_json(project_file, project)
     return project_file
@@ -233,6 +262,12 @@ def main() -> None:
         assert not invalid.parent.exists()
         project = fixture(temporary_path)
         command = [sys.executable, str(ROOT / "scripts/meetup-video.py"), "--project", str(project)]
+        timeline_path = project.parent / "build/timeline.json"
+        timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+        atomic_write_json(timeline_path, {**timeline, "duration": DURATION - 0.5})
+        bad_duration = subprocess.run([*command, "check"], capture_output=True, text=True)
+        assert bad_duration.returncode and "timeline duration" in bad_duration.stderr
+        atomic_write_json(timeline_path, timeline)
         run(*command, "check")
         run(*command, "preview", "--duration", str(DURATION))
         run(
@@ -248,6 +283,9 @@ def main() -> None:
         )
         red, green, blue = sample_pixel(late_preview, 700, 400)
         assert green > 180 and red < 80 and blue < 80, (red, green, blue)
+        unapproved = subprocess.run([*command, "final"], capture_output=True, text=True)
+        assert unapproved.returncode and "not explicitly approved" in unapproved.stderr
+        run(*command, "approve")
         edl = project.parent / "final-edits.json"
         approved_edl = edl.read_bytes()
         edl.write_bytes(approved_edl + b" ")
@@ -256,6 +294,29 @@ def main() -> None:
         edl.write_bytes(approved_edl)
         run(*command, "final")
         run(*command, "validate", "--resolution", "1920x1080")
+        final = project.parent / "output/final/final.mp4"
+        level = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                "stream=level", "-of", "default=nw=1:nk=1", str(final),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert int(level.stdout.strip()) <= 42, level.stdout
+        make_mask(
+            project.parent / "build/privacy/full-blur.mp4",
+            "black",
+            (1.0, 1.19),
+        )
+        edited_privacy = subprocess.run(
+            [*command, "validate", "--resolution", "1920x1080"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        assert "all 1 full-blur intervals are removed by the EDL" in edited_privacy.stdout
     print("synthetic check -> preview -> final -> validate passed")
 
 

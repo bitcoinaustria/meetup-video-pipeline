@@ -18,10 +18,12 @@ from video_common import (
     canonical_sha256,
     configured_analyzer,
     content_fingerprint,
+    ensure_slides_text,
     event_context,
     file_sha256,
     host_capabilities,
     optional_project_path,
+    presentation_bounds,
     project_path,
     read_prompt_source,
     resolve_project_path,
@@ -30,7 +32,6 @@ from video_common import (
     source_range_output_duration,
     source_to_output,
     speaker_position,
-    timeline_events_in_range,
 )
 
 
@@ -43,7 +44,7 @@ def load_project(path: Path) -> dict:
     project = json.loads(path.read_text(encoding="utf-8"))
     required = (
         "video",
-        "slides_pdf",
+        "slides_text",
         "background",
         "timeline",
         "slides",
@@ -57,6 +58,8 @@ def load_project(path: Path) -> dict:
     missing = [key for key in required if key not in project]
     if missing:
         raise SystemExit(f"project is missing: {', '.join(missing)}")
+    if not project.get("slides_pdf") and not project.get("screen_recording"):
+        raise SystemExit("project needs slides_pdf or screen_recording")
     project["_project_dir"] = str(path.parent)
     return project
 
@@ -134,18 +137,12 @@ def slide_titles(slides_text: Path, presentation_title: str) -> dict[int, str]:
 def chapter_entries(project: dict) -> list[tuple[float, str]]:
     if not project.get("chapters_enabled", True):
         return []
-    slides_text = project_path(project, "slides_text")
-    slides_text.parent.mkdir(parents=True, exist_ok=True)
-    if not slides_text.exists():
-        subprocess.run(
-            ["pdftotext", "-layout", str(project_path(project, "slides_pdf")), str(slides_text)],
-            check=True,
-        )
+    slides_text = ensure_slides_text(project)
     titles = slide_titles(slides_text, project["presentation_title"])
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
     edits = json.loads(project_path(project, "edl").read_text(encoding="utf-8"))["edits"]
     faq = json.loads(project_path(project, "faq").read_text(encoding="utf-8"))["entries"]
-    start = float(project["presentation_start"])
+    start, end = presentation_bounds(project, float(timeline["duration"]))
 
     minimum_gap = float(project.get("chapter_min_seconds", 180.0))
     chapters = [(0.0, project["presentation_title"])]
@@ -155,7 +152,7 @@ def chapter_entries(project: dict) -> list[tuple[float, str]]:
         title = titles.get(int(slide["page"]))
         mapped = source_to_output(source_time, start, edits, faq)
         if (
-            source_time > start
+            start < source_time < end
             and title
             and title not in used_titles
             and mapped - chapters[-1][0] >= minimum_gap
@@ -246,9 +243,9 @@ def timeline_data(project: dict) -> tuple[list[dict], list[dict]]:
 
 def expected_render_duration(project: dict) -> float:
     edits, faq = timeline_data(project)
-    start = float(project["presentation_start"])
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
-    return source_range_output_duration(start, float(timeline["duration"]) - start, edits, faq)
+    start, end = presentation_bounds(project, float(timeline["duration"]))
+    return source_range_output_duration(start, end - start, edits, faq)
 
 
 def render_identity(project: dict) -> dict:
@@ -286,6 +283,7 @@ def render_identity(project: dict) -> dict:
     identity = {
         "version": 1,
         "presentation_start": float(project["presentation_start"]),
+        "presentation_end": project.get("presentation_end"),
         "render": {
             "resolution": project.get("final_resolution", "3840x2160"),
             "encoder": profile["video_encoder"]["name"],
@@ -388,16 +386,46 @@ def gray_frame(path: Path, timestamp: float, filters: str) -> np.ndarray:
     return np.frombuffer(frame, dtype=np.uint8).astype(np.int16)
 
 
-def full_blur_sample_times(mask: Path) -> list[float]:
+def full_blur_intervals(mask: Path) -> list[list[float]]:
+    timestamp_lines = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_frames",
+            "-show_entries", "frame=best_effort_timestamp_time", "-of", "default=nw=1:nk=1",
+            str(mask),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+    timestamps = []
+    for line in timestamp_lines:
+        try:
+            timestamps.append(float(line))
+        except ValueError:
+            pass
     samples = subprocess.run(
         [
-            "ffmpeg", "-v", "error", "-i", str(mask), "-vf", "fps=2,scale=1:1,format=gray",
+            "ffmpeg", "-v", "error", "-i", str(mask), "-vf", "scale=1:1,format=gray",
             "-f", "rawvideo", "-pix_fmt", "gray", "-",
         ],
         check=True,
         capture_output=True,
     ).stdout
-    return [index / 2 for index, value in enumerate(samples) if value >= 220]
+    if len(timestamps) != len(samples):
+        raise SystemExit(
+            f"privacy mask frame scan disagrees: {len(timestamps)} timestamps, {len(samples)} frames"
+        )
+    intervals: list[list[float]] = []
+    current: list[float] = []
+    for timestamp, value in zip(timestamps, samples, strict=True):
+        if value >= 220:
+            current.append(timestamp)
+        elif current:
+            intervals.append(current)
+            current = []
+    if current:
+        intervals.append(current)
+    return intervals
 
 
 def high_frequency_energy(frame: np.ndarray) -> float:
@@ -408,32 +436,71 @@ def high_frequency_energy(frame: np.ndarray) -> float:
     )
 
 
+def periodic_frame_samples(times: list[float], interval: float = 0.5) -> list[float]:
+    if not times:
+        return []
+    groups = [[times[0]]]
+    for timestamp in times[1:]:
+        if timestamp - groups[-1][-1] > 0.1:
+            groups.append([timestamp])
+        else:
+            groups[-1].append(timestamp)
+    samples = []
+    for group in groups:
+        selected = [group[0]]
+        for timestamp in group[1:-1]:
+            if timestamp - selected[-1] >= interval:
+                selected.append(timestamp)
+        if group[-1] != selected[-1]:
+            selected.append(group[-1])
+        samples.extend(selected)
+    return samples
+
+
 def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
-    mask_times = full_blur_sample_times(project_path(project, "full_blur_mask"))
-    if not mask_times:
+    intervals = full_blur_intervals(project_path(project, "full_blur_mask"))
+    if not intervals:
         print("privacy artifact check: no full-blur interval to sample")
         return
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
     track = json.loads(resolve_project_path(project, timeline["speaker_track"]).read_text(encoding="utf-8"))
     edits, faq = timeline_data(project)
     presentation_start = float(project["presentation_start"])
+    _range_start, presentation_end = presentation_bounds(project, float(timeline["duration"]))
     output_width, output_height = map(int, resolution.split("x"))
-    scale = output_width / 3840
-    scaled = lambda value: round(value * scale)
+    source_width = float(timeline.get("source_width", 3840))
+    if source_width <= 0:
+        raise SystemExit("timeline source_width must be positive")
+    layout_scale = output_width / 3840
+    source_scale = output_width / source_width
     crop = timeline["speaker_crop"]
-    panel = (scaled(91), scaled(296), scaled(864), scaled(1536))
+    panel = tuple(round(value * layout_scale) for value in (91, 296, 864, 1536))
     actual_filter = f"crop={panel[2]}:{panel[3]}:{panel[0]}:{panel[1]},scale=216:384"
     conclusive = 0
     passed = 0
     contrasts = []
-    for mask_time in mask_times[::max(1, len(mask_times) // 12)]:
+    samples = []
+    for interval in intervals:
+        available = [
+            mask_time
+            for mask_time in interval
+            if not any(
+                float(edit["source_start"]) <= presentation_start + mask_time < float(edit["source_end"])
+                for edit in edits
+            )
+            and presentation_start + mask_time < presentation_end
+        ]
+        if available:
+            samples.extend(periodic_frame_samples(available))
+    if not samples:
+        print(f"privacy artifact check: all {len(intervals)} full-blur intervals are removed by the EDL")
+        return
+    for mask_time in samples:
         source_time = presentation_start + mask_time
-        if timeline_events_in_range(source_time - 0.02, 0.04, edits, []):
-            continue
         position = speaker_position(track, source_time)
         crop_filter = (
-            f"crop={scaled(crop['width'])}:{scaled(crop['height'])}:"
-            f"{position[0] * scale:.3f}:{scaled(crop['y'])},"
+            f"crop={round(crop['width'] * source_scale)}:{round(crop['height'] * source_scale)}:"
+            f"{position[0] * source_scale:.3f}:{round(crop['y'] * source_scale)},"
             f"scale={panel[2]}:{panel[3]},scale=216:384"
         )
         clean = gray_frame(
@@ -472,9 +539,10 @@ def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
 
 
 def check(project: dict, project_file: Path, final: bool = False) -> None:
+    ensure_slides_text(project)
     keys = (
         "video",
-        "slides_pdf",
+        "slides_text",
         "background",
         "timeline",
         "slides",
@@ -483,6 +551,10 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
         "privacy_mask",
         "full_blur_mask",
     )
+    if project.get("slides_pdf"):
+        keys += ("slides_pdf",)
+    if project.get("screen_recording"):
+        keys += ("screen_recording",)
     if project.get("audio_edits"):
         keys += ("audio_edits",)
     if project.get("base_edits"):
@@ -542,8 +614,13 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
 
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
     source_seconds = float(timeline["duration"])
-    start = float(project["presentation_start"])
-    expected = source_seconds - start
+    media_seconds = float(source_probe["format"]["duration"])
+    if abs(source_seconds - media_seconds) > 1 / 30:
+        raise SystemExit(
+            f"timeline duration is {source_seconds:.3f}s, source video is {media_seconds:.3f}s"
+        )
+    start, presentation_end = presentation_bounds(project, source_seconds)
+    expected = presentation_end - start
     for key in ("privacy_mask", "full_blur_mask"):
         actual = duration(project_path(project, key))
         if actual + 1 / 30 < expected:
@@ -572,6 +649,11 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
     required_free = max(6 * GIB, estimated_output * 1.35)
     profile = host_capabilities(project)
     detector = profile["privacy_detector"]
+    if not detector["available"] or not detector.get("qualified", False):
+        raise SystemExit(
+            "a qualified privacy detector is required: "
+            f"{detector.get('reason') or 'detector is unavailable'}"
+        )
     print(
         "inputs and privacy checks passed; "
         f"encoder: {profile['video_encoder']['name']}; "
@@ -597,12 +679,15 @@ def render(
         check(project, project_file, final=True)
     resolution = project.get("final_resolution", "3840x2160") if final else "1920x1080"
     edits, faq = timeline_data(project)
-    source_duration = (
-        float(json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))["duration"])
-        - start
-        if render_duration is None
-        else render_duration
+    timeline_duration = float(
+        json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))["duration"]
     )
+    presentation_start, presentation_end = presentation_bounds(project, timeline_duration)
+    if start < presentation_start or start >= presentation_end:
+        raise SystemExit("render start must stay inside the presentation range")
+    if render_duration is not None and not 0 < render_duration <= presentation_end - start + 1 / 30:
+        raise SystemExit("render duration must stay inside the presentation range")
+    source_duration = presentation_end - start if render_duration is None else render_duration
     expected = source_range_output_duration(start, source_duration, edits, faq)
     audio_policy = "process_and_preserve_each_channel_separately"
     audio_edits = optional_project_path(project, "audio_edits")
@@ -659,8 +744,8 @@ def render(
     ]
     if encoder in {"libx264", "libx265"} and preset:
         command.extend(("--preset", str(preset)))
-    if render_duration is not None:
-        command.extend(("--duration", str(render_duration)))
+    if render_duration is not None or presentation_end < timeline_duration:
+        command.extend(("--duration", str(source_duration)))
     subprocess.run(command, check=True)
     return expected
 
@@ -676,6 +761,8 @@ def final_render(project: dict, project_file: Path) -> None:
         approval = {}
     if approval.get("identity", {}).get("sha256") != identity["sha256"]:
         raise SystemExit("preview approval is missing or stale; render and inspect a new preview")
+    if approval.get("approved") is not True:
+        raise SystemExit("preview exists but is not explicitly approved")
     lock = output.with_suffix(output.suffix + ".lock")
     temporary = output.with_name(f"{output.stem}.rendering{output.suffix}")
     try:
@@ -723,12 +810,7 @@ def final_render(project: dict, project_file: Path) -> None:
 
 
 def publishing_copy(project: dict, project_file: Path, analyzer: str | None = None) -> None:
-    slides_text = project_path(project, "slides_text")
-    slides_text.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        ["pdftotext", "-layout", str(project_path(project, "slides_pdf")), str(slides_text)],
-        check=True,
-    )
+    slides_text = ensure_slides_text(project)
     faq_context = (
         Path(project.get("_project_dir", ROOT))
         / "build/faq-analysis"
@@ -840,7 +922,12 @@ def build_audio(project: dict, project_file: Path, analyzer: str | None = None) 
         str(resources["jobs"]),
         "--gpu-jobs",
         str(resources["gpu_jobs"]),
+        "--start",
+        str(project["presentation_start"]),
     ]
+    timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
+    start, end = presentation_bounds(project, float(timeline["duration"]))
+    command.extend(("--duration", str(end - start)))
     if analyzer:
         command.extend(("--analyzer", analyzer))
     for key, option in (
@@ -868,6 +955,8 @@ def render_shorts(project: dict, project_file: Path) -> None:
             str(resources["render_jobs"]),
             "--threads",
             str(resources["threads_per_job"]),
+            "--gpu-jobs",
+            str(resources["gpu_jobs"]),
         ],
         check=True,
     )
@@ -890,6 +979,7 @@ def main() -> None:
     preview.add_argument("--start", type=float)
     preview.add_argument("--duration", type=float, default=60.0)
     preview.add_argument("--output", type=Path)
+    subparsers.add_parser("approve")
     subparsers.add_parser("copy")
     subparsers.add_parser("chapters")
     subparsers.add_parser("audio")
@@ -925,14 +1015,33 @@ def main() -> None:
             preview_approval_path(project),
             {
                 "version": 1,
+                "approved": False,
                 "identity": render_identity(project),
                 "preview": {
                     "path": str(output),
                     "source_start": start,
                     "source_duration": args.duration,
+                    "expected_duration": expected,
+                    "artifact": content_fingerprint(output),
                 },
             },
         )
+    elif args.command == "approve":
+        approval_path = preview_approval_path(project)
+        try:
+            approval = json.loads(approval_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise SystemExit("render and inspect a preview before approval") from error
+        if approval.get("identity", {}).get("sha256") != render_identity(project)["sha256"]:
+            raise SystemExit("preview is stale; render and inspect a new preview")
+        preview = approval.get("preview", {})
+        preview_file = Path(str(preview.get("path", "")))
+        if not preview_file.is_absolute():
+            preview_file = Path(project["_project_dir"]) / preview_file
+        if not preview_file.is_file() or preview.get("artifact") != content_fingerprint(preview_file):
+            raise SystemExit("preview artifact is missing or changed; render it again")
+        atomic_write_json(approval_path, {**approval, "approved": True})
+        print(approval_path)
     elif args.command == "copy":
         publishing_copy(project, args.project, args.analyzer)
     elif args.command == "chapters":
