@@ -535,6 +535,69 @@ def presentation_bounds(project: dict, source_duration: float) -> tuple[float, f
     return start, min(end, source_duration)
 
 
+def analysis_range_matches(source: dict, start: float, end: float) -> bool:
+    try:
+        recorded = source["range"]
+        return (
+            abs(float(recorded["start"]) - start) <= 1e-6
+            and abs(float(recorded["duration"]) - (end - start)) <= 1e-6
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def privacy_provenance_path(project: dict) -> Path:
+    return resolve_project_path(
+        project, project.get("privacy_provenance", "build/privacy/provenance.json")
+    )
+
+
+def privacy_artifact_identity(project: dict) -> dict:
+    timeline_path = project_path(project, "timeline")
+    timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+    start, end = presentation_bounds(project, float(timeline["duration"]))
+    profile = host_capabilities(project)
+    identity = {
+        "version": 1,
+        "source": content_fingerprint(project_path(project, "video")),
+        "range": {"start": start, "end": end},
+        "geometry": {
+            key: timeline.get(key)
+            for key in ("source_width", "source_height", "speaker_crop", "screen_crop")
+        },
+        "timeline": content_fingerprint(timeline_path),
+        "speaker_track": content_fingerprint(
+            resolve_project_path(project, timeline["speaker_track"])
+        ),
+        "privacy_mask": content_fingerprint(project_path(project, "privacy_mask")),
+        "full_blur_mask": content_fingerprint(project_path(project, "full_blur_mask")),
+        "detector": {
+            "identity": profile["signature"]["privacy_detector_identity"],
+            "qualification": profile["signature"][
+                "privacy_detector_qualification_identity"
+            ],
+            "trust": profile["signature"]["privacy_detector_trust_identity"],
+        },
+    }
+    return {**identity, "sha256": canonical_sha256(identity)}
+
+
+def require_privacy_provenance(project: dict) -> None:
+    path = privacy_provenance_path(project)
+    try:
+        provenance = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SystemExit(
+            "privacy provenance is missing or invalid; review and seal the masks"
+        ) from error
+    if (
+        provenance.get("status") != "approved"
+        or not provenance.get("reviewed_by")
+        or provenance.get("identity") != privacy_artifact_identity(project)
+    ):
+        raise SystemExit("privacy provenance is stale; review and seal the masks again")
+
+
 def source_range_output_duration(
     start: float,
     duration: float,

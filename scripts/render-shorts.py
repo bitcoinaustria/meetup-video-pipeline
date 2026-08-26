@@ -19,6 +19,7 @@ from video_common import (
     host_capabilities,
     presentation_bounds,
     project_path,
+    require_privacy_provenance,
     source_to_output,
     timeline_events_in_range,
     whisper_tokens,
@@ -360,6 +361,7 @@ def main() -> None:
         raise SystemExit("jobs, gpu-jobs, and threads must be positive")
     project["_audio_threads"] = args.threads
     project["_render_threads"] = args.threads
+    require_privacy_provenance(project)
     project["_video_encoder"] = host_capabilities(project)["video_encoder"]["name"]
     global WHISPER, WHISPER_MODEL
     if project.get("whisper_binary"):

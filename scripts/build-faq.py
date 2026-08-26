@@ -15,6 +15,7 @@ import wave
 from pathlib import Path
 
 from video_common import (
+    analysis_range_matches,
     atomic_write_json,
     atomic_write_text,
     canonical_sha256,
@@ -679,6 +680,7 @@ def write_outputs(
     scan_end: float,
     work: Path,
 ) -> None:
+    presentation_start, presentation_end = presentation_bounds(project, source_duration)
     generated_cuts = []
     faq_entries = []
     review = ["# FAQ candidates", ""]
@@ -790,8 +792,11 @@ def write_outputs(
             source_path.resolve() != configured_video.resolve()
             or int(audio_data.get("source", {}).get("size", -1)) != source_fingerprint["size"]
             or audio_data.get("source", {}).get("sha256") != source_fingerprint["sha256"]
+            or not analysis_range_matches(
+                audio_data.get("source", {}), presentation_start, presentation_end
+            )
         ):
-            raise SystemExit("audio edits are stale or do not belong to the configured source video")
+            raise SystemExit("audio edits are stale or do not belong to the configured talk range")
         existing.extend(audio_data.get("edits", []))
     preserved = []
     for edit in existing:

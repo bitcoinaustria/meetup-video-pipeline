@@ -278,7 +278,7 @@ def transcribe(
     threads: int,
     *,
     cpu_only: bool = False,
-) -> tuple[Path, str]:
+) -> Path:
     output = output_prefix.with_suffix(".json")
     temporary_prefix = output_prefix.with_name(f".{output_prefix.name}.tmp")
     temporary_output = Path(f"{temporary_prefix}.json")
@@ -311,20 +311,18 @@ def transcribe(
         if not temporary_output.exists():
             raise SystemExit(f"Whisper did not create {temporary_output}")
         temporary_output.replace(output)
-        return output, "cpu"
+        return output
 
-    backend = "gpu"
     try:
         run(command)
     except subprocess.CalledProcessError:
         print("Whisper GPU run failed; retrying on CPU.", file=sys.stderr)
         temporary_output.unlink(missing_ok=True)
         run([command[0], "--no-gpu", *command[1:]])
-        backend = "cpu"
     if not temporary_output.exists():
         raise SystemExit(f"Whisper did not create {temporary_output}")
     temporary_output.replace(output)
-    return output, backend
+    return output
 
 
 def transcribe_chunks(
@@ -350,11 +348,8 @@ def transcribe_chunks(
         transcript = prefix.with_suffix(".json")
         if refresh or not chunk_wav.exists():
             extract_audio_clip(wav_path, chunk_start, chunk_duration, chunk_wav)
-        backend = "cached"
         if refresh or not transcript.exists():
-            transcript, backend = transcribe(
-                chunk_wav, prefix, whisper, model, language, threads
-            )
+            transcript = transcribe(chunk_wav, prefix, whisper, model, language, threads)
         chunk_offset = source_offset + chunk_start
         words.extend(transcript_words(transcript, channel, chunk_offset))
         files.append(
@@ -362,7 +357,7 @@ def transcribe_chunks(
                 "channel": channel,
                 "path": manifest_path(transcript, project_dir),
                 "source_offset": chunk_offset,
-                "backend": backend,
+                "sha256": file_sha256(transcript),
             }
         )
     return words, files
@@ -482,7 +477,6 @@ def transcribe_secondary_chunks(
             cached = json.loads(cache.read_text(encoding="utf-8")) if cache.exists() else None
         except (OSError, json.JSONDecodeError):
             cached = None
-        backend = "cached"
         if not cached or cached.get("identity") != identity:
             temporary = tempfile.NamedTemporaryFile(
                 prefix=f"secondary-{channel}-{window_index:03d}-",
@@ -517,7 +511,6 @@ def transcribe_secondary_chunks(
                 return [], {"status": "failed_closed", "reason": "invalid response"}
             cached = {"identity": identity, "payload": payload}
             atomic_write_json(cache, cached)
-            backend = "typewhisper"
 
         window_words = [
             word for word in primary_words[channel]
@@ -531,7 +524,7 @@ def transcribe_secondary_chunks(
             "path": manifest_path(cache, Path(project["_project_dir"])),
             "source_offset": global_offset,
             "duration": round(window_duration, 3),
-            "backend": backend,
+            "sha256": file_sha256(cache),
         }
         return hints, artifact
 
@@ -1105,7 +1098,7 @@ def refine_fillers(
         transcript = prefix.with_suffix(".json")
         if refresh or not transcript.exists():
             extract_audio_clip(channel_wavs[channel], local_start, 4.0, clip)
-            transcript, _ = transcribe(
+            transcript = transcribe(
                 clip,
                 prefix,
                 args.whisper,
@@ -1472,7 +1465,7 @@ def semantic_review(
         )
     elif cached and cached.get("identity") == identity and cached.get("status") in {"passed", "cached"}:
         analysis = cached["analysis"]
-        status = "cached"
+        status = "passed"
     elif not candidates:
         analysis = {"decisions": []}
         status = "passed"

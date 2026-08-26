@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from video_common import (
     _command_status,
+    analysis_range_matches,
     build_time_map,
     detector_command_identity,
     detector_command_sha256,
@@ -46,6 +47,8 @@ assert source_to_output(13, 10, edits, faq) == 2
 assert source_to_output(14, 10, edits, faq) == 8
 assert source_range_output_duration(10, 10, edits, faq) == 14
 assert presentation_bounds({"presentation_start": 10, "presentation_end": 20}, 30) == (10, 20)
+assert analysis_range_matches({"range": {"start": 10, "duration": 10}}, 10, 20)
+assert not analysis_range_matches({"range": {"start": 0, "duration": 30}}, 10, 20)
 assert timeline_events_in_range(11.5, 1, edits, faq) == ["cut 12.000-13.000"]
 assert timeline_events_in_range(14, 1, edits, faq) == []
 assert build_time_map(3, [{"source_start": 1, "source_end": 2}])["output_duration"] == 2

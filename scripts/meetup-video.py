@@ -13,6 +13,7 @@ from urllib.parse import urlparse
 import numpy as np
 
 from video_common import (
+    analysis_range_matches,
     atomic_write_json,
     atomic_write_text,
     canonical_sha256,
@@ -24,10 +25,13 @@ from video_common import (
     host_capabilities,
     optional_project_path,
     presentation_bounds,
+    privacy_artifact_identity,
+    privacy_provenance_path,
     project_path,
     read_prompt_source,
     resolve_project_path,
     resource_budget,
+    require_privacy_provenance,
     run_structured_model,
     source_range_output_duration,
     source_to_output,
@@ -303,47 +307,6 @@ def preview_approval_path(project: dict) -> Path:
     return Path(project["_project_dir"]) / "build/preview-approval.json"
 
 
-def privacy_provenance_path(project: dict) -> Path:
-    return resolve_project_path(
-        project, project.get("privacy_provenance", "build/privacy/provenance.json")
-    )
-
-
-def privacy_artifact_identity(project: dict) -> dict:
-    timeline_path = project_path(project, "timeline")
-    timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
-    start, end = presentation_bounds(project, float(timeline["duration"]))
-    profile = host_capabilities(project)
-    identity = {
-        "version": 1,
-        "source": source_fingerprint(project),
-        "range": {"start": start, "end": end},
-        "geometry": {
-            key: timeline.get(key)
-            for key in (
-                "source_width",
-                "source_height",
-                "speaker_crop",
-                "screen_crop",
-            )
-        },
-        "timeline": content_fingerprint(timeline_path),
-        "speaker_track": content_fingerprint(
-            resolve_project_path(project, timeline["speaker_track"])
-        ),
-        "privacy_mask": content_fingerprint(project_path(project, "privacy_mask")),
-        "full_blur_mask": content_fingerprint(project_path(project, "full_blur_mask")),
-        "detector": {
-            "identity": profile["signature"]["privacy_detector_identity"],
-            "qualification": profile["signature"][
-                "privacy_detector_qualification_identity"
-            ],
-            "trust": profile["signature"]["privacy_detector_trust_identity"],
-        },
-    }
-    return {**identity, "sha256": canonical_sha256(identity)}
-
-
 def seal_privacy(project: dict, reviewed_by: str) -> Path:
     if not reviewed_by.strip():
         raise SystemExit("privacy review requires a reviewer identifier")
@@ -366,20 +329,6 @@ def seal_privacy(project: dict, reviewed_by: str) -> Path:
         },
     )
     return path
-
-
-def require_privacy_provenance(project: dict) -> None:
-    path = privacy_provenance_path(project)
-    try:
-        provenance = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        raise SystemExit("privacy provenance is missing or invalid; review and seal the masks") from error
-    if (
-        provenance.get("status") != "approved"
-        or not provenance.get("reviewed_by")
-        or provenance.get("identity") != privacy_artifact_identity(project)
-    ):
-        raise SystemExit("privacy provenance is stale; review and seal the masks again")
 
 
 def final_metadata_path(project: dict) -> Path:
@@ -665,6 +614,8 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
     if not source_audio or int(source_audio.get("channels", 0)) not in {1, 2}:
         channels = source_audio.get("channels", "missing") if source_audio else "missing"
         raise SystemExit(f"source video must contain mono or stereo audio; found {channels} channels")
+    media_seconds = float(source_probe["format"]["duration"])
+    presentation_start, presentation_end = presentation_bounds(project, media_seconds)
     final_edits = json.loads(project_path(project, "edl").read_text(encoding="utf-8")).get("edits", [])
 
     def represented(candidate: dict) -> bool:
@@ -688,8 +639,11 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
             audio_source_path.resolve() != configured_video.resolve()
             or int(audio_source.get("size", -1)) != fingerprint["size"]
             or audio_source.get("sha256") != fingerprint["sha256"]
+            or not analysis_range_matches(
+                audio_source, presentation_start, presentation_end
+            )
         ):
-            raise SystemExit("audio edit artifact is stale for the configured source video")
+            raise SystemExit("audio edit artifact is stale for the configured talk range")
         channels = audio_edits.get("channel_analysis", {})
         print(
             "audio input: "
@@ -710,7 +664,6 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
 
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
     source_seconds = float(timeline["duration"])
-    media_seconds = float(source_probe["format"]["duration"])
     if abs(source_seconds - media_seconds) > 1 / 30:
         raise SystemExit(
             f"timeline duration is {source_seconds:.3f}s, source video is {media_seconds:.3f}s"
@@ -1106,8 +1059,9 @@ def main() -> None:
     elif args.command == "preview":
         start = args.start if args.start is not None else float(project["presentation_start"])
         output = (
-            args.output
-            or Path(project["_project_dir"]) / "output/debug/previews/preview-1080p.mp4"
+            args.output.resolve()
+            if args.output
+            else Path(project["_project_dir"]) / "output/debug/previews/preview-1080p.mp4"
         )
         output.parent.mkdir(parents=True, exist_ok=True)
         expected = render(project, args.project, start, args.duration, output, final=False)

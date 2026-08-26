@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -304,9 +305,10 @@ def main() -> None:
             str(project.parent / "output/debug/previews/preview-1080p.mp4"),
         )
         late_preview = project.parent / "output/debug/previews/late-slide.mp4"
+        relative_late_preview = os.path.relpath(late_preview, Path.cwd())
         run(
             *command, "preview", "--start", "2.5", "--duration", "1.5",
-            "--output", str(late_preview),
+            "--output", relative_late_preview,
         )
         red, green, blue = sample_pixel(late_preview, 700, 400)
         assert green > 180 and red < 80 and blue < 80, (red, green, blue)
