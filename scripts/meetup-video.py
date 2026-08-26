@@ -15,6 +15,7 @@ from video_common import (
     atomic_write_json,
     atomic_write_text,
     canonical_sha256,
+    configured_analyzer,
     content_fingerprint,
     file_sha256,
     optional_project_path,
@@ -680,7 +681,7 @@ def final_render(project: dict, project_file: Path) -> None:
         lock.rmdir()
 
 
-def publishing_copy(project: dict, project_file: Path) -> None:
+def publishing_copy(project: dict, project_file: Path, analyzer: str | None = None) -> None:
     slides_text = project_path(project, "slides_text")
     slides_text.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
@@ -735,7 +736,7 @@ x_post, including that placeholder, at or below 270 characters so replacing it w
 Do not invent or include chapters or timecodes; they are appended deterministically.
 Do not use markdown inside the three values.
 """.strip()
-    copy = run_structured_model(project.get("publishing_analyzer", "claude"), schema, prompt)
+    copy = run_structured_model(configured_analyzer(project, "publishing", analyzer), schema, prompt)
     if (
         len(copy.get("title", "")) >= 100
         or not 1200 <= len(copy.get("description", "")) <= 1800
@@ -757,14 +758,14 @@ Do not use markdown inside the three values.
     print(output)
 
 
-def build_faq(project_file: Path) -> None:
-    subprocess.run(
-        [sys.executable, str(ROOT / "scripts/build-faq.py"), "--project", str(project_file)],
-        check=True,
-    )
+def build_faq(project_file: Path, analyzer: str | None = None) -> None:
+    command = [sys.executable, str(ROOT / "scripts/build-faq.py"), "--project", str(project_file)]
+    if analyzer:
+        command.extend(("--analyzer", analyzer))
+    subprocess.run(command, check=True)
 
 
-def build_audio(project: dict, project_file: Path) -> None:
+def build_audio(project: dict, project_file: Path, analyzer: str | None = None) -> None:
     command = [
         sys.executable,
         str(ROOT / "scripts/audio-post.py"),
@@ -780,6 +781,8 @@ def build_audio(project: dict, project_file: Path) -> None:
         "--threads",
         str(project.get("audio_threads", max(1, os.cpu_count() or 1))),
     ]
+    if analyzer:
+        command.extend(("--analyzer", analyzer))
     for key, option in (
         ("whisper_binary", "--whisper"),
         ("whisper_model", "--scan-model"),
@@ -808,6 +811,7 @@ def render_shorts(project: dict, project_file: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="One-command meetup video workflow.")
     parser.add_argument("--project", type=Path, default=ROOT / "video-project.json")
+    parser.add_argument("--analyzer")
     subparsers = parser.add_subparsers(dest="command", required=True)
     init = subparsers.add_parser("init")
     init.add_argument("--name", required=True)
@@ -856,14 +860,14 @@ def main() -> None:
             },
         )
     elif args.command == "copy":
-        publishing_copy(project, args.project)
+        publishing_copy(project, args.project, args.analyzer)
     elif args.command == "chapters":
         write_chapters(project, args.project)
     elif args.command == "audio":
-        build_audio(project, args.project)
+        build_audio(project, args.project, args.analyzer)
     elif args.command == "faq":
-        build_audio(project, args.project)
-        build_faq(args.project)
+        build_audio(project, args.project, args.analyzer)
+        build_faq(args.project, args.analyzer)
     elif args.command == "shorts":
         render_shorts(project, args.project)
     elif args.command == "validate":
@@ -873,10 +877,10 @@ def main() -> None:
         validate_privacy_render(target, project, resolution)
     else:
         if project.get("rebuild_analysis_before_final", True):
-            build_audio(project, args.project)
-            build_faq(args.project)
+            build_audio(project, args.project, args.analyzer)
+            build_faq(args.project, args.analyzer)
         if args.command == "release":
-            publishing_copy(project, args.project)
+            publishing_copy(project, args.project, args.analyzer)
         final_render(project, args.project)
 
 

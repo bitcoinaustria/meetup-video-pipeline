@@ -17,6 +17,7 @@ from video_common import (
     atomic_write_json,
     atomic_write_text,
     canonical_sha256,
+    configured_analyzer,
     content_fingerprint,
     file_sha256,
     read_prompt_source,
@@ -792,6 +793,7 @@ def write_outputs(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build complete audience FAQ edits from transcript and audio level.")
     parser.add_argument("--project", type=Path, default=ROOT / "video-project.json")
+    parser.add_argument("--analyzer")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
@@ -883,7 +885,7 @@ def main() -> None:
         if analysis is None:
             print("reviewed FAQ analysis is stale; running automatic analysis", file=sys.stderr)
     if analysis is None:
-        provider = project.get("faq_analyzer", "codex")
+        provider = configured_analyzer(project, "faq", args.analyzer)
         identity_base = {
             "prompt_version": PROMPT_VERSION,
             "provider": provider,

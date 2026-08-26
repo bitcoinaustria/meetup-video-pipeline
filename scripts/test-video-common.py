@@ -6,6 +6,7 @@ from pathlib import Path
 
 from video_common import (
     build_time_map,
+    configured_analyzer,
     content_fingerprint,
     ffconcat_quote,
     source_range_output_duration,
@@ -24,6 +25,17 @@ assert source_range_output_duration(10, 10, edits, faq) == 14
 assert timeline_events_in_range(11.5, 1, edits, faq) == ["cut 12.000-13.000"]
 assert timeline_events_in_range(14, 1, edits, faq) == []
 assert build_time_map(3, [{"source_start": 1, "source_end": 2}])["output_duration"] == 2
+assert configured_analyzer({"analyzer": "codex"}, "audio") == "codex"
+assert configured_analyzer(
+    {"analyzer": "codex", "audio_analyzer": "claude"}, "audio"
+) == "claude"
+assert configured_analyzer({"analyzer": "codex"}, "audio", "claude") == "claude"
+try:
+    configured_analyzer({}, "audio")
+except SystemExit as error:
+    assert "no analyzer selected" in str(error)
+else:
+    raise AssertionError("missing analyzer must fail closed")
 assert ffconcat_quote(Path("it's.mp4")) == "'it'\\''s.mp4'"
 assert list(
     whisper_tokens(

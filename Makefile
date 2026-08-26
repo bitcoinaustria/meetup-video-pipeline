@@ -1,6 +1,6 @@
 PYTHON := $(shell test -x .venv/bin/python && echo .venv/bin/python || echo python3)
 PROJECT ?= video-project.json
-RUN := $(PYTHON) scripts/meetup-video.py --project $(PROJECT)
+RUN := $(PYTHON) scripts/meetup-video.py --project $(PROJECT) $(if $(ANALYZER),--analyzer $(ANALYZER))
 
 .PHONY: init check preview copy chapters audio faq shorts validate final release test
 

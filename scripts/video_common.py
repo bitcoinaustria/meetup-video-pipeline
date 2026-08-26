@@ -196,6 +196,16 @@ def read_prompt_source(path: Path, maximum_bytes: int = 2_000_000) -> str:
     return data.decode("utf-8")
 
 
+def configured_analyzer(project: dict, stage: str, override: str | None = None) -> str:
+    provider = override or project.get(f"{stage}_analyzer") or project.get("analyzer")
+    if not provider:
+        raise SystemExit(
+            "no analyzer selected; set ANALYZER=<agent> for this run or "
+            f"configure analyzer/{stage}_analyzer in the project"
+        )
+    return str(provider)
+
+
 def run_structured_model(provider: str, schema: dict, prompt: str, timeout: float = 300) -> dict:
     with tempfile.TemporaryDirectory(prefix="meetup-analysis-") as directory:
         workspace = Path(directory)

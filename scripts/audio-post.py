@@ -21,6 +21,7 @@ from video_common import (
     atomic_write_text,
     build_time_map,
     canonical_sha256,
+    configured_analyzer,
     content_fingerprint,
     ffconcat_quote,
     file_sha256 as sha256_file,
@@ -1805,7 +1806,7 @@ def analyze(args: argparse.Namespace) -> None:
     for index, decision in enumerate(decisions, 1):
         decision["id"] = f"audio-{index:04d}"
     semantic = semantic_review(
-        decisions, project, args.output, project.get("audio_analyzer", "claude"), identity
+        decisions, project, args.output, configured_analyzer(project, "audio", args.analyzer), identity
     )
 
     edl = {
@@ -2035,6 +2036,7 @@ def main() -> None:
     subparsers = parser.add_subparsers(dest="command", required=True)
     analyze_parser = subparsers.add_parser("analyze")
     analyze_parser.add_argument("--project", type=Path, default=DEFAULT_PROJECT)
+    analyze_parser.add_argument("--analyzer")
     analyze_parser.add_argument("--video", type=Path)
     analyze_parser.add_argument("--timeline", type=Path)
     analyze_parser.add_argument("--output", type=Path)

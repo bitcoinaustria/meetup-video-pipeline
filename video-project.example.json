@@ -16,7 +16,6 @@
   "slides": "build/slides",
   "base_edits": "manual-edits.json",
   "audio_edits": "build/audio-post/automatic-edits.json",
-  "audio_analyzer": "claude",
   "audio_secondary_transcriber": {
     "enabled": true,
     "required": true,
@@ -26,7 +25,6 @@
   "edl": "final-edits.json",
   "faq": "faq-timeline.json",
   "faq_scan_start": 0.0,
-  "faq_analyzer": "codex",
   "faq_card_duration": 7.5,
   "faq_card_min_answer_seconds": 12.0,
   "faq_label": "FRAGE AUS DEM PUBLIKUM",

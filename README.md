@@ -14,7 +14,7 @@ The generator is presentation-neutral: event facts, source paths, terminology, t
 - Xcode Command Line Tools for Apple Vision detection and OCR
 - [whisper.cpp](https://github.com/ggml-org/whisper.cpp) plus a local Large-v3 model
 - TypeWhisper with Parakeet TDT v3 when the secondary audio pass is required
-- Codex CLI or Claude CLI for grounded FAQ and speech-edit review
+- The CLI for the analyzer selected by the invoking agent (`codex` or `claude`)
 
 On macOS:
 
@@ -43,14 +43,19 @@ Every command accepts the same manifest through `PROJECT`:
 ```sh
 make check PROJECT=projects/my-talk/project.json
 make preview PROJECT=projects/my-talk/project.json START=260 DURATION=60
-make audio PROJECT=projects/my-talk/project.json
-make faq PROJECT=projects/my-talk/project.json
-make final PROJECT=projects/my-talk/project.json
+make audio PROJECT=projects/my-talk/project.json ANALYZER=codex
+make faq PROJECT=projects/my-talk/project.json ANALYZER=codex
+make final PROJECT=projects/my-talk/project.json ANALYZER=codex
 make shorts PROJECT=projects/my-talk/project.json
-make copy PROJECT=projects/my-talk/project.json
+make copy PROJECT=projects/my-talk/project.json ANALYZER=codex
 make chapters PROJECT=projects/my-talk/project.json
 make validate PROJECT=projects/my-talk/project.json
 ```
+
+The manifest's `analyzer` selects the default agent for every semantic stage. The invoking
+agent can select or override it for a run with `ANALYZER=codex` (or `claude`); optional
+`audio_analyzer`, `faq_analyzer`, and `publishing_analyzer` settings override individual
+stages. The generator has no vendor-specific default.
 
 `make final` rebuilds context-gated speech edits and audience FAQ coverage, renders at `final_resolution`, validates stereo audio and visible frames, then atomically replaces the configured final output. `make release` additionally regenerates grounded publishing copy. A short 1080p preview is the required approval gate before an expensive production render.
 
