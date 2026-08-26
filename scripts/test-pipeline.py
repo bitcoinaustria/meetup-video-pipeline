@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
@@ -268,14 +269,33 @@ def main() -> None:
         assert not invalid.parent.exists()
         project = fixture(temporary_path)
         command = [sys.executable, str(ROOT / "scripts/meetup-video.py"), "--project", str(project)]
-        run(*command, "privacy-seal", "--reviewed-by", "synthetic test")
+        spec = importlib.util.spec_from_file_location("meetup_video", ROOT / "scripts/meetup-video.py")
+        assert spec and spec.loader
+        meetup_video = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(meetup_video)
+        loaded_project = json.loads(project.read_text(encoding="utf-8"))
+        loaded_project["_project_dir"] = str(project.parent)
+        profile = meetup_video.host_capabilities(loaded_project, refresh=True)
+        assert not profile["privacy_detector"]["qualified"]
+        test_profile = json.loads(json.dumps(profile))
+        test_profile["privacy_detector"].update(
+            {"available": True, "qualified": True, "reason": "synthetic test injection"}
+        )
+        with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
+            meetup_video.seal_privacy(loaded_project, "synthetic test")
         timeline_path = project.parent / "build/timeline.json"
         timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
         atomic_write_json(timeline_path, {**timeline, "duration": DURATION - 0.5})
-        bad_duration = subprocess.run([*command, "check"], capture_output=True, text=True)
-        assert bad_duration.returncode and "timeline duration" in bad_duration.stderr
+        with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
+            try:
+                meetup_video.check(loaded_project, project)
+            except SystemExit as error:
+                assert "timeline duration" in str(error)
+            else:
+                raise AssertionError("stale timeline duration must fail")
         atomic_write_json(timeline_path, timeline)
-        run(*command, "check")
+        with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
+            meetup_video.check(loaded_project, project)
         run(*command, "preview", "--duration", str(DURATION))
         run(
             *command,
@@ -299,7 +319,8 @@ def main() -> None:
         stale = subprocess.run([*command, "final"], capture_output=True, text=True)
         assert stale.returncode and "preview approval is missing or stale" in stale.stderr
         edl.write_bytes(approved_edl)
-        run(*command, "final")
+        with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
+            meetup_video.final_render(loaded_project, project)
         run(*command, "validate", "--resolution", "1920x1080")
         final = project.parent / "output/final/final.mp4"
         level = subprocess.run(
@@ -317,12 +338,6 @@ def main() -> None:
             "black",
             (1.0, 1.19),
         )
-        spec = importlib.util.spec_from_file_location("meetup_video", ROOT / "scripts/meetup-video.py")
-        assert spec and spec.loader
-        meetup_video = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(meetup_video)
-        loaded_project = json.loads(project.read_text(encoding="utf-8"))
-        loaded_project["_project_dir"] = str(project.parent)
         privacy_output = io.StringIO()
         with contextlib.redirect_stdout(privacy_output):
             meetup_video.validate_privacy_render(final, loaded_project, "1920x1080")

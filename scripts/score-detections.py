@@ -11,6 +11,7 @@ from video_common import (
     actual_detection_counts as detected_counts,
     atomic_write_json,
     detector_command_identity,
+    detector_command_sha256,
     expected_detection_counts as expected_counts,
     file_sha256,
     score_detection_counts as score,
@@ -94,14 +95,16 @@ def main() -> None:
         "overlap_recall"
     ] >= args.minimum_overlap_recall
     if args.qualification_output:
+        detector_identity = detector_command_identity(
+            detector_command, Path.cwd(), args.detector_artifact
+        )
         atomic_write_json(
             args.qualification_output,
             {
                 "version": 1,
                 "parser_policy": "minimum-height-0.12-v1",
-                "detector": detector_command_identity(
-                    detector_command, Path.cwd(), args.detector_artifact
-                ),
+                "detector": detector_identity,
+                "command_sha256": detector_command_sha256(detector_identity),
                 "labels_sha256": file_sha256(args.labels),
                 "inputs_sha256": file_sha256(args.inputs),
                 "detections_sha256": file_sha256(detections),

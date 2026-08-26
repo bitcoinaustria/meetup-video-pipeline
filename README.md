@@ -156,7 +156,7 @@ python3 scripts/score-detections.py labels.tsv --inputs inputs.tsv \
 ```
 
 Set `privacy_detector_qualification` to that artifact and list every implementation and model file in `privacy_detector_artifacts`. The command and file paths must match the manifest exactly; changing any bound file invalidates qualification.
-Qualification output preserves the detector TSV so recall is recomputed at every gate. A maintainer must also approve the exact label/input and detector-artifact hashes in `privacy-detector-trust.json`; project files cannot extend that trust store.
+Qualification output preserves the detector TSV so recall is recomputed at every gate. A maintainer must also approve the exact label/input/detection hashes, normalized command identity, and detector-artifact hashes in `privacy-detector-trust.json`; project files cannot extend that trust store. The shipped store has no production detector entries, so non-macOS production fails closed until a real backend and representative labeled dataset are reviewed.
 
 `video-project.example.json` documents all reusable settings. Local project folders and review decisions are ignored by Git; branded layout templates and generator code are versioned.
 

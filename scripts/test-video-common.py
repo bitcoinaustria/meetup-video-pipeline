@@ -14,6 +14,7 @@ from video_common import (
     _command_status,
     build_time_map,
     detector_command_identity,
+    detector_command_sha256,
     configured_analyzer,
     content_fingerprint,
     encoder_candidates,
@@ -140,10 +141,12 @@ with tempfile.TemporaryDirectory() as directory:
         "0\t\n1\t0,0,1,1\n2\t0,0,1,1;0,0,1,1\n",
         encoding="utf-8",
     )
+    detector_identity = detector_command_identity(detector, Path(directory), detector_artifacts)
     atomic_qualification = {
         "version": 1,
         "parser_policy": "minimum-height-0.12-v1",
-        "detector": detector_command_identity(detector, Path(directory), detector_artifacts),
+        "detector": detector_identity,
+        "command_sha256": detector_command_sha256(detector_identity),
         "labels_sha256": file_sha256(FIXTURE_LABELS),
         "inputs_sha256": file_sha256(FIXTURE_INPUTS),
         "detections_sha256": file_sha256(qualification_detections),
@@ -159,6 +162,26 @@ with tempfile.TemporaryDirectory() as directory:
         },
     }
     qualification.write_text(json.dumps(atomic_qualification), encoding="utf-8")
+    trusted_store = Path(directory) / "trust.json"
+    trusted_store.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "approved_qualifications": [
+                    {
+                        "labels_sha256": atomic_qualification["labels_sha256"],
+                        "inputs_sha256": atomic_qualification["inputs_sha256"],
+                        "detections_sha256": atomic_qualification["detections_sha256"],
+                        "command_sha256": atomic_qualification["command_sha256"],
+                        "detector_artifact_sha256s": [file_sha256(FIXTURE_DETECTOR)],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    trust_patch = patch("video_common.DETECTOR_TRUST", trusted_store)
+    trust_patch.start()
     for configured in (detector, detector_string):
         resolved_detector = privacy_detector_command(
             {
@@ -217,6 +240,7 @@ with tempfile.TemporaryDirectory() as directory:
                 assert message in str(error)
             else:
                 raise AssertionError(message)
+    trust_patch.stop()
 
     source = Path(directory) / "source"
     copy = Path(directory) / "copy"

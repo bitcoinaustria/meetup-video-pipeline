@@ -160,6 +160,23 @@ def detector_command_identity(
     return {**identity, "artifacts": bound}
 
 
+def detector_command_sha256(identity: dict) -> str:
+    tokens = []
+    files = identity.get("files", {})
+    for index, token in enumerate(identity.get("command", [])):
+        file_identity = files.get(str(index))
+        if file_identity:
+            name = Path(token).name.lower()
+            tokens.append(
+                "interpreter:python"
+                if index == 0 and name.startswith("python")
+                else f"file:{file_identity['sha256']}"
+            )
+        else:
+            tokens.append(token)
+    return canonical_sha256(tokens)
+
+
 def parse_detection_coordinates(encoded: str, minimum_height: float = 0.12) -> list[tuple[float, ...]]:
     boxes = [tuple(map(float, item.split(","))) for item in encoded.split(";") if item]
     return [box for box in boxes if len(box) == 4 and box[3] >= minimum_height]
@@ -212,9 +229,12 @@ def detector_qualification_is_trusted(artifact: dict, detector_identity: dict) -
     except (OSError, json.JSONDecodeError):
         return False
     artifact_hashes = sorted(item["sha256"] for item in detector_identity.get("artifacts", []))
+    command_sha256 = detector_command_sha256(detector_identity)
     return trust.get("version") == 1 and any(
         entry.get("labels_sha256") == artifact.get("labels_sha256")
         and entry.get("inputs_sha256") == artifact.get("inputs_sha256")
+        and entry.get("detections_sha256") == artifact.get("detections_sha256")
+        and entry.get("command_sha256") == artifact.get("command_sha256") == command_sha256
         and sorted(entry.get("detector_artifact_sha256s", [])) == artifact_hashes
         for entry in trust.get("approved_qualifications", [])
     )
