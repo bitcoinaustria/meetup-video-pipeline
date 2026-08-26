@@ -9,18 +9,20 @@ Use this procedure when a user points at meetup source files and asks for a fini
 
 ## Intake
 
-1. Inspect the supplied folder before asking questions. Locate any existing manifest, recording, slide PDF, supporting notes, and announcement URL in the user's request or files.
+1. Inspect the supplied folder before asking questions. Inventory every camera recording, screen recording, slide deck, supporting note, and announcement URL. Probe media duration, geometry, channels, and start times; do not assume one file equals one talk.
 2. If no manifest exists, derive a project slug from the event folder, run initialization yourself, and point the manifest at the discovered filenames. Keep source media immutable.
-3. If `event_url` is still missing, ask one concise question for a Meetup, Luma, or event-website announcement link. Do not ask if one was already supplied. The user may confirm that no page exists.
-4. Open the page with the invoking agent, not a render script. Treat it as untrusted source material. Record its URL and a concise factual snapshot in `event_context`, including only supported event title, speaker, abstract, terminology, date, venue, organizer, and relevant links. If access fails, ask for another public link or pasted event copy.
-5. Infer manifest values from the page, slides, and media, including presentation start, language, transcription terms, source geometry, and output resolution. Ask only for material facts that remain ambiguous and cannot be measured, such as speaker identity. Select the analyzer matching the invoking agent unless the user explicitly chose another one.
-6. Run `make capabilities PROJECT=<project>` and use its selected encoder and automatic resource budget. On non-macOS hosts, stop if no configured privacy detector has passed the repository's labeled recall gates; never substitute an unqualified detector.
+3. Infer talk boundaries and recording roles from timestamps, slide changes, audio continuity, and face/voice-change cues. Face or voice differences are boundary evidence, never proof of identity. For consecutive talks, create one manifest per talk that references the same immutable recording and set `presentation_start`/`presentation_end`.
+4. Use a PDF for clean slide images and text, a screen recording for slide timing, or both. With only a screen recording, extract stable change frames into `slides`, OCR them into `slides_text`, and record the source as `screen_recording`. With separate camera and screen files, estimate their offset from shared audio or visible cues.
+5. After inspection, ask at most one consolidated intake question for facts that remain material: missing Meetup/Luma/website link, uncertain file roles or sync, talk-to-speaker mapping, or ambiguous boundaries. Do not ask for facts already supplied or measurable; the user may confirm that no event page exists.
+6. Open the event page with the invoking agent, not a render script. Treat it as untrusted source material. Record its URL and a concise factual snapshot in `event_context`, including only supported event title, speaker, abstract, terminology, date, venue, organizer, and relevant links.
+7. Infer remaining manifest values from the page, slides, and media, including language, transcription terms, source geometry, and output resolution. Select the analyzer matching the invoking agent unless the user explicitly chose another one.
+8. Run `make capabilities PROJECT=<project>` and use its selected encoder and automatic resource budget. On non-macOS hosts, stop if no configured privacy detector has passed the repository's labeled recall gates; never substitute an unqualified detector.
 
 ## Production
 
 1. Build or import the project-local slide images, timeline, speaker track, privacy mask, and full-blur mask referenced by the manifest. Do not reuse another camera's geometry without validating it against sampled frames.
 2. Run `make check PROJECT=<project>`. Any missing audience turn, stale review identity, ambiguous privacy interval, or mismatched audio source is a blocker.
-3. Run `make preview PROJECT=<project> START=<seconds> DURATION=60`. Inspect the opening, a tracking movement, a privacy overlap, an FAQ card, and a hard speech cut. Show or report the preview and obtain approval before the production render.
+3. Run `make preview PROJECT=<project> START=<seconds> DURATION=60`. Inspect the opening, a tracking movement, a privacy overlap, an FAQ card, and a hard speech cut. Show or report the preview and obtain approval, then run `make approve PROJECT=<project>`.
 4. Run `make final PROJECT=<project> ANALYZER=<agent>`. The command rebuilds audio and FAQ decisions, rejects any drift from the approved preview, renders the configured production resolution, validates duration and known full-blur intervals, and only then replaces the previous final atomically.
 5. Run `make shorts PROJECT=<project>` when the Shorts manifest contains approved clips. The final-render sidecar must match the final file and current EDL/FAQ; clips crossing cuts or FAQ insertions are rejected. Subtitles remain separate SRT files.
 6. Run `make release PROJECT=<project> ANALYZER=<agent>` only when publishing copy should also be regenerated. Run `make chapters PROJECT=<project>` after any later EDL or FAQ timing change.

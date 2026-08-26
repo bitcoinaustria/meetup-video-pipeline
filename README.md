@@ -1,6 +1,6 @@
 # Meetup Video Pipeline
 
-Local-first tooling for turning a single-camera meetup recording and a slide PDF into branded long-form video and vertical clips. The pipeline combines digital slides, smooth speaker tracking, fail-closed privacy blurring, conservative speech edits, full-cover FAQ cards, subtitles, chapters, thumbnails, and publishing copy without a traditional video editor.
+Local-first tooling for turning meetup camera footage plus a slide deck, screen recording, or both into branded long-form video and vertical clips. The pipeline combines clean presentation visuals, smooth speaker tracking, fail-closed privacy blurring, conservative speech edits, full-cover FAQ cards, subtitles, chapters, thumbnails, and publishing copy without a traditional video editor.
 
 The included templates use Bitcoin Austria branding as a working example. Replace the background, logo, publishing voice, and organization fields for another organizer.
 
@@ -40,8 +40,9 @@ Put the recording, slide PDF, and any supporting files in an event folder, for e
 
 ```text
 projects/my-talk/source/
-├── recording.mp4
-└── slides.pdf
+├── camera.mp4
+├── screen.mp4       # optional
+└── slides.pdf       # optional when screen.mp4 exists
 ```
 
 Then ask a production agent to handle that folder. No filenames, manifest, or `make`
@@ -50,13 +51,21 @@ commands are required from the user. An announcement link can be included immedi
 > Produce the meetup video from `projects/my-talk/source`. Event information:
 > `https://example.com/events/my-talk`
 
-The agent inventories the files, creates or completes the project manifest, and uses the
+The agent inventories all recordings, creates or completes the project manifest, and uses the
 announcement page for the event title, speaker, abstract, terminology, date, venue, and
 organizer context. If no Meetup, Luma, or website link was supplied in the request, manifest,
 or supporting files, the agent asks for one; the user can confirm that no page exists. The
-agent captures supported facts in `event_context`, selects its own analyzer adapter, runs the
-pipeline gates, requests preview approval, and reports the finished artifacts. Render scripts
-never browse independently.
+agent also resolves camera/screen roles, sync, and talk boundaries from the media. It asks one
+consolidated question only when those facts or speaker mapping remain ambiguous. Face and voice
+changes are useful boundary cues, not identity proof. A continuous recording with several talks
+becomes one project per talk, each referencing the same source with its own
+`presentation_start` and `presentation_end`.
+
+When a PDF and screen recording both exist, the PDF supplies clean images/text and the screen
+recording supplies timings. With only a screen recording, the agent extracts stable frames and
+OCR text before the normal render gates. It captures event facts in `event_context`, uses its own
+analyzer adapter, requests preview approval, and reports the artifacts; render scripts never
+browse or choose an agent independently.
 
 Paths in a manifest resolve relative to that manifest, so a complete project folder can be
 archived to shared storage and restored on another checkout.
@@ -73,6 +82,7 @@ Every command accepts the same manifest through `PROJECT`:
 make check PROJECT=projects/my-talk/project.json
 make capabilities PROJECT=projects/my-talk/project.json
 make preview PROJECT=projects/my-talk/project.json START=260 DURATION=60
+make approve PROJECT=projects/my-talk/project.json
 make audio PROJECT=projects/my-talk/project.json ANALYZER=codex
 make faq PROJECT=projects/my-talk/project.json ANALYZER=codex
 make final PROJECT=projects/my-talk/project.json ANALYZER=codex
@@ -99,7 +109,7 @@ agent selects or overrides it with `ANALYZER=codex` (or `claude`); optional
 `audio_analyzer`, `faq_analyzer`, and `publishing_analyzer` settings override individual
 stages. The generator has no vendor-specific default.
 
-`make final` rebuilds context-gated speech edits and audience FAQ coverage, renders at `final_resolution`, validates stereo audio and visible frames, then atomically replaces the configured final output. `make release` additionally regenerates grounded publishing copy. A short 1080p preview is the required approval gate before an expensive production render.
+`make final` rebuilds context-gated speech edits and audience FAQ coverage, renders at `final_resolution`, validates stereo audio and visible frames, then atomically replaces the configured final output. `make release` additionally regenerates grounded publishing copy. A short 1080p preview followed by explicit `make approve` is the required approval gate before an expensive production render.
 
 Preview approval is content-addressed: if the source, EDL, FAQ timeline, slides, masks, speaker track, or renderer changes, `make final` stops until a new preview is inspected. Final validation samples known full-blur intervals in the artifact, and the final-render sidecar binds Shorts to the exact final file and current EDL/FAQ hashes.
 
@@ -135,7 +145,15 @@ Contributor checks, including a generated project in a path containing an apostr
 make test
 ```
 
-Use `scripts/score-detections.py` against labeled count TSVs before adopting a detector replacement; its default gates prioritize any-person and overlapping-person recall.
+Use `scripts/score-detections.py` against labeled count TSVs before adopting a detector replacement; its default gates prioritize any-person and overlapping-person recall. Bind the passing result to the exact command used by the manifest:
+
+```sh
+python3 scripts/score-detections.py labels.tsv --inputs inputs.tsv \
+  --detector-command '/usr/bin/python3 /opt/people-detector.py {inputs} {output}' \
+  --qualification-output build/detector-qualification.json
+```
+
+Set `privacy_detector_qualification` to that artifact. The command and file paths must match the manifest exactly; changing detector code invalidates qualification.
 
 `video-project.example.json` documents all reusable settings. Local project folders and review decisions are ignored by Git; branded layout templates and generator code are versioned.
 
