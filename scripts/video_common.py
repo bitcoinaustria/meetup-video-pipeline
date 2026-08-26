@@ -408,7 +408,7 @@ def run_structured_model(provider: str, schema: dict, prompt: str, timeout: floa
                 "claude", "-p", "--safe-mode", "--setting-sources", "user",
                 "--strict-mcp-config", "--mcp-config", "{}", "--tools", "",
                 "--permission-mode", "dontAsk", "--no-session-persistence",
-                "--output-format", "json", "--json-schema", json.dumps(schema), prompt,
+                "--output-format", "json", "--json-schema", json.dumps(schema),
             ]
         elif provider == "codex":
             schema_path = workspace / "schema.json"
@@ -421,11 +421,18 @@ def run_structured_model(provider: str, schema: dict, prompt: str, timeout: floa
                 "-c", "skills.include_instructions=false", "-c", "skills.config=[]",
                 "-c", 'default_permissions="meetup_analysis"',
                 "-c", 'permissions.meetup_analysis.filesystem={":minimal"="read",":workspace_roots"="read"}',
-                "--output-schema", str(schema_path), prompt,
+                "--output-schema", str(schema_path), "-",
             ]
         else:
             raise SystemExit(f"unsupported analyzer: {provider}")
-        result = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            input=prompt,
+            text=True,
+            timeout=timeout,
+        )
     payload = json.loads(result.stdout)
     if provider == "claude":
         structured = payload.get("structured_output")

@@ -1407,6 +1407,15 @@ def semantic_confidence_threshold(decision: dict) -> float:
     return 0.9
 
 
+def legacy_semantic_identity_matches(identity: dict, current: dict) -> bool:
+    legacy = json.loads(json.dumps(identity))
+    legacy.get("source", {}).pop("mtime_ns", None)
+    expected = json.loads(json.dumps(current))
+    expected.get("source", {}).pop("sha256", None)
+    expected.pop("event_context_sha256", None)
+    return legacy == expected
+
+
 def semantic_review(
     decisions: list[dict], project: dict, output: Path, provider: str, source: dict, workers: int
 ) -> dict:
@@ -1452,12 +1461,7 @@ def semantic_review(
         pinned_identity = pinned.get("identity", {})
         identity_matches = pinned_identity == review_key
         if not identity_matches and isinstance(pinned_identity, dict):
-            legacy = json.loads(json.dumps(pinned_identity))
-            legacy_source = legacy.get("source", {})
-            legacy_source.pop("mtime_ns", None)
-            current_without_hash = json.loads(json.dumps(review_key))
-            current_without_hash.get("source", {}).pop("sha256", None)
-            identity_matches = legacy == current_without_hash
+            identity_matches = legacy_semantic_identity_matches(pinned_identity, review_key)
             if identity_matches and pinned_path:
                 pinned["identity"] = review_key
                 atomic_write_json(pinned_path, pinned)
@@ -1916,6 +1920,13 @@ def analyze(args: argparse.Namespace) -> None:
 
 
 def self_test() -> None:
+    assert legacy_semantic_identity_matches(
+        {"source": {"path": "source.mp4", "size": 10, "mtime_ns": 1}},
+        {
+            "source": {"path": "source.mp4", "size": 10, "sha256": "current"},
+            "event_context_sha256": "context",
+        },
+    )
     words = {
         1: [
             {"text": "Wir", "normalized": "wir", "start": 0.0, "end": 0.3, "probability": 0.99, "channel": 1},

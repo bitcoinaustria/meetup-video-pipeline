@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 
+import json
 import platform
 import shutil
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from video_common import (
     build_time_map,
@@ -16,6 +19,7 @@ from video_common import (
     ffconcat_quote,
     privacy_detector_command,
     resource_budget,
+    run_structured_model,
     source_range_output_duration,
     source_to_output,
     timeline_events_in_range,
@@ -48,6 +52,21 @@ if platform.system() != "Darwin":
         assert "no qualified privacy detector" in str(error)
     else:
         raise AssertionError("non-macOS privacy detection must fail closed")
+
+large_prompt = "x" * 200_000
+schema = {"type": "object"}
+with patch("video_common.subprocess.run") as model_run:
+    model_run.return_value = SimpleNamespace(
+        stdout=json.dumps({"structured_output": {"ok": True}})
+    )
+    assert run_structured_model("claude", schema, large_prompt) == {"ok": True}
+    assert model_run.call_args.kwargs["input"] == large_prompt
+    assert large_prompt not in model_run.call_args.args[0]
+with patch("video_common.subprocess.run") as model_run:
+    model_run.return_value = SimpleNamespace(stdout=json.dumps({"ok": True}))
+    assert run_structured_model("codex", schema, large_prompt) == {"ok": True}
+    assert model_run.call_args.kwargs["input"] == large_prompt
+    assert model_run.call_args.args[0][-1] == "-"
 assert configured_analyzer(
     {"analyzer": "codex", "audio_analyzer": "claude"}, "audio"
 ) == "claude"
