@@ -105,16 +105,6 @@ def review_identity(
     }
 
 
-def legacy_review_identity_matches(identity: dict, expected: dict) -> bool:
-    legacy = {**identity, "size": identity.get("video_size")}
-    for key in ("video_size", "video_mtime_ns", "sha256"):
-        legacy.pop(key, None)
-    current = {**expected}
-    for key in ("sha256", "event_context_sha256"):
-        current.pop(key, None)
-    return legacy == current
-
-
 def duration(path: Path) -> float:
     return float(
         run(
@@ -612,10 +602,7 @@ def load_reviewed_analysis(
     reviewed = json.loads(path.read_text(encoding="utf-8"))
     identity = reviewed.get("identity", {})
     if identity != expected_identity:
-        if not legacy_review_identity_matches(identity, expected_identity):
-            return None
-        reviewed["identity"] = expected_identity
-        atomic_write_json(path, reviewed)
+        return None
     candidate_set = set(candidates)
     context_segments = [segment for segment in segments if segment["id"] not in candidate_set]
     if not context_segments:
@@ -1029,15 +1016,6 @@ def self_test() -> None:
         annotate_levels(stereo, second, 2)
         assert second[0]["level_dbfs"] > first[0]["level_dbfs"] + 10
         assert annotate_levels(stereo, [], 2) == -120.0
-    assert legacy_review_identity_matches(
-        {"video_path": "source.mp4", "video_size": 10, "video_mtime_ns": 1},
-        {
-            "video_path": "source.mp4",
-            "size": 10,
-            "sha256": "current",
-            "event_context_sha256": "context",
-        },
-    )
     assert merge_cuts(
         [
             {"source_start": 1.0, "source_end": 2.0, "types": ["a"]},

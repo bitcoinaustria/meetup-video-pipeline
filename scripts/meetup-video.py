@@ -436,7 +436,7 @@ def high_frequency_energy(frame: np.ndarray) -> float:
     )
 
 
-def periodic_frame_samples(times: list[float], interval: float = 0.5) -> list[float]:
+def representative_frame_samples(times: list[float], maximum: int = 7) -> list[float]:
     if not times:
         return []
     groups = [[times[0]]]
@@ -447,13 +447,13 @@ def periodic_frame_samples(times: list[float], interval: float = 0.5) -> list[fl
             groups[-1].append(timestamp)
     samples = []
     for group in groups:
-        selected = [group[0]]
-        for timestamp in group[1:-1]:
-            if timestamp - selected[-1] >= interval:
-                selected.append(timestamp)
-        if group[-1] != selected[-1]:
-            selected.append(group[-1])
-        samples.extend(selected)
+        if len(group) <= maximum:
+            samples.extend(group)
+        else:
+            samples.extend(
+                group[round(index * (len(group) - 1) / (maximum - 1))]
+                for index in range(maximum)
+            )
     return samples
 
 
@@ -491,10 +491,13 @@ def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
             and presentation_start + mask_time < presentation_end
         ]
         if available:
-            samples.extend(periodic_frame_samples(available))
+            samples.extend(representative_frame_samples(available))
     if not samples:
         print(f"privacy artifact check: all {len(intervals)} full-blur intervals are removed by the EDL")
         return
+    # ponytail: bounded process count; batch FFmpeg validation if real projects exceed this.
+    if len(samples) > 720:
+        raise SystemExit("privacy mask is too fragmented for bounded artifact validation")
     for mask_time in samples:
         source_time = presentation_start + mask_time
         position = speaker_position(track, source_time)
