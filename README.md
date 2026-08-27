@@ -72,6 +72,74 @@ archived to shared storage and restored on another checkout.
 
 The initial camera/slide calibration produces the timeline, slide images, speaker track, and two privacy masks referenced by the manifest. These physical-camera values stay project-specific; the render and edit pipeline never assumes one event's crop or speaker position applies to another. See the [agent production runbook](.agents/skills/meetup-video-production/SKILL.md) for the exact gates and artifact contract.
 
+### Multiple programme speakers
+
+The timeline may opt into reviewed programme sections and a three-panel dual-speaker layout.
+Slides remain centered, participant identities stay on fixed left/right sides, and optional `active`
+metadata adds a restrained border without moving either person. Participant tracks use the normal
+source-time `time`/`x` samples plus reviewed `visible` booleans; an invisible participant is not
+rendered or chased beyond the frame. Use an explicit standard section at a reviewed sentence
+boundary when a sustained absence should return to the larger single-speaker layout.
+
+```json
+{
+  "participants": {
+    "host_a": {
+      "track": "build/host-a-track.json",
+      "crop": {"width": 720, "height": 1920, "y": 120},
+      "audio_channel": 1
+    },
+    "host_b": {
+      "track": "build/host-b-track.json",
+      "crop": {"width": 720, "height": 1920, "y": 120},
+      "audio_channel": 2
+    }
+  },
+  "layout_sections": [
+    {
+      "source_start": 0.0,
+      "source_end": 75.0,
+      "kind": "intro",
+      "layout": "dual_speaker",
+      "left": "host_a",
+      "right": "host_b",
+      "active": "left"
+    },
+    {
+      "source_start": 75.0,
+      "source_end": 3600.0,
+      "kind": "talk",
+      "layout": "standard",
+      "audio_channel": 1
+    }
+  ],
+  "mix_mapped_microphones": true,
+  "microphone_mix": {
+    "inactive_gain": 0.18,
+    "both_gain": 0.5,
+    "fade_seconds": 0.12,
+    "integrated_lufs": -18.0,
+    "true_peak_db": -2.0
+  }
+}
+```
+
+Reviewed microphone mixing is opt-in and requires contiguous sections covering the recording.
+Mapped DJI channels are normalized independently, centered, crossfaded at reviewed speaker turns,
+and limited after mixing; inactive microphones remain audible at a reduced gain so overlap is never
+discarded. Unmapped stereo is preserved unchanged. Every participant track is bound into the
+privacy seal and preview/final identity. An ambiguous or overlapping participant still activates
+the existing full-camera blur. Dual-speaker privacy review covers the complete reviewed sections
+and matches participant geometry plus appearance; a missing, substituted, or ambiguous identity
+fails closed to full-camera blur.
+
+Audio post-production also identifies German and English moderator time/wrap-up cues as
+`production_interruption` candidates. Wording, locally relative level, shared quiet boundaries,
+section role, transcript reconnection, and semantic review must agree before a non-overlapping cue
+from a mapped non-presenter microphone inside a standard talk can be cut. Same-channel cues, plus
+cues in introductions, news, discussions, Q&A, missing section context, or overlapping channels,
+remain review-only.
+
 ## Pipeline contract
 
 The production agent uses these commands as a reproducible internal interface. They remain
@@ -113,7 +181,7 @@ stages. The generator has no vendor-specific default.
 
 `make final` rebuilds context-gated speech edits and audience FAQ coverage, renders at `final_resolution`, validates stereo audio and visible frames, then atomically replaces the configured final output. `make release` additionally regenerates grounded publishing copy. A short 1080p preview followed by explicit `make approve` is the required approval gate before an expensive production render.
 
-Privacy approval is content-addressed: `make privacy-seal` binds both masks to the source hash, talk range, geometry, speaker track, qualified detector artifacts, and repository-approved labeled dataset. Preview approval then binds the complete render inputs. Any drift stops final rendering or validation until the affected review is repeated. Final validation samples known full-blur intervals in the artifact, and the final-render sidecar binds Shorts to the exact final file and current EDL/FAQ hashes.
+Privacy approval is content-addressed: `make privacy-seal` binds both masks to the source hash, talk range, geometry, every participant track, qualified detector artifacts, and repository-approved labeled dataset. Preview approval then binds the complete render inputs. Any drift stops final rendering or validation until the affected review is repeated. Final validation samples known full-blur intervals in every active camera panel, and the final-render sidecar binds Shorts to the exact final file and current EDL/FAQ hashes.
 
 ## Output layout
 
@@ -135,6 +203,7 @@ Source media remains in the project's `source/` directory. Intermediate assets b
 - One source-time EDL drives audio, video, tracking, slides, FAQ insertion, chapters, and Shorts.
 - Multi-pass speech editing cuts only when deterministic, acoustic, speaker-context, and semantic checks agree.
 - Mono input is duplicated to the required stereo output. Stereo input is inspected before processing because its channels can contain two independent mono microphones.
+- Independent microphones are mixed only when reviewed sections explicitly map every channel and turn; true stereo is never inferred as a two-mic mix.
 - Ambiguous speaker identity or overlapping people trigger full-camera blur; privacy fails closed.
 - Camera timestamps remain the render clock, preventing duplicate catch-up frames around hard cuts.
 - Source media is immutable. Caches live in `build/` and `tmp/`; release artifacts live in categorized `output/` subdirectories.
