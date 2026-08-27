@@ -9,6 +9,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -48,10 +49,43 @@ AMBIGUOUS_REPETITIONS = {
     "sehr", "sie", "so", "wir",
 }
 TRANSCRIPT_CHUNK_SECONDS = 15 * 60
-SEMANTIC_POLICY = "tight-v10-acoustic-adaptive-transition"
+SEMANTIC_POLICY = "tight-v12-mapped-moderator-interruptions"
 SECONDARY_POLICY = "parakeet-insertions-v1"
 SECONDARY_WINDOW_SECONDS = 60
 SECONDARY_WINDOW_HOP_SECONDS = 30
+PRODUCTION_INTERRUPTION_LOCAL_WINDOW_SECONDS = 30
+PRODUCTION_INTERRUPTION_RELATIVE_LEVEL_DB = -6.0
+PRODUCTION_INTERRUPTION_MAX_SECONDS = 8.0
+PRODUCTION_INTERRUPTION_RULES = {
+    "de": (
+        (
+            "time_remaining",
+            re.compile(
+                r"\b(?:(?:du\s+hast|sie\s+haben)\s+)?(?:noch\s+)?"
+                r"(?:eine?r?|eins|zwei|drei|vier|fünf|fuenf|sechs|\d+)\s+"
+                r"minuten?\b|\b(?:eine?r?|eins|zwei|drei|vier|fünf|fuenf|sechs|\d+)\s+"
+                r"minuten?\s+(?:noch|übrig|uebrig|verbleibend)\b"
+            ),
+        ),
+        ("wrap_up", re.compile(r"\b(?:bitte\s+)?zum\s+(?:ende|schluss)\s+kommen\b")),
+        ("time_up", re.compile(r"\bdie\s+zeit\s+ist\s+um\b|\bzeit\s+ist\s+um\b")),
+    ),
+    "en": (
+        (
+            "time_remaining",
+            re.compile(
+                r"\b(?:you\s+have\s+)?(?:one|two|three|four|five|six|\d+)\s+minutes?\s+"
+                r"(?:left|remaining)\b|\byou\s+have\s+(?:one|two|three|four|five|six|\d+)\s+minutes?\b"
+            ),
+        ),
+        ("wrap_up", re.compile(r"\b(?:please\s+)?wrap\s+up\b")),
+        ("time_up", re.compile(r"\btime\s+is\s+up\b")),
+    ),
+}
+PRODUCTION_ACKNOWLEDGEMENTS = {
+    "de": re.compile(r"(?:ok|okay|danke|alles klar)"),
+    "en": re.compile(r"(?:ok|okay|thanks|thank you|got it)"),
+}
 
 
 def run(command: list[str], *, capture: bool = False, timeout: float | None = None) -> str:
@@ -1030,7 +1064,7 @@ def snap_decisions_to_frames(decisions: list[dict], frame_rate: float) -> None:
 
 
 def normalize_word(text: str) -> str:
-    return re.sub(r"[^a-zäöüß]+", "", text.casefold())
+    return re.sub(r"[^a-z0-9äöüß]+", "", text.casefold())
 
 
 def transcript_words(path: Path, channel: int, source_offset: float) -> list[dict]:
@@ -1068,6 +1102,262 @@ def overlaps(words: list[dict], start: float, end: float, ignored_channel: int) 
         word["channel"] != ignored_channel and word["start"] < end and word["end"] > start
         for word in words
     )
+
+
+def production_interruption_rule(tokens: list[str], language: str) -> str | None:
+    text = " ".join(tokens)
+    rules = PRODUCTION_INTERRUPTION_RULES.get(language.casefold().split("-", 1)[0], ())
+    return next((name for name, pattern in rules if pattern.fullmatch(text)), None)
+
+
+def production_acknowledgement(
+    words_by_channel: dict[int, list[dict]], cue_end: float, language: str
+) -> list[dict]:
+    pattern = PRODUCTION_ACKNOWLEDGEMENTS.get(language.casefold().split("-", 1)[0])
+    if not pattern:
+        return []
+    best = []
+    for words in words_by_channel.values():
+        following = [
+            word
+            for word in words
+            if cue_end <= float(word["start"]) <= cue_end + 1.2
+        ][:3]
+        for size in range(min(3, len(following)), 0, -1):
+            candidate = following[:size]
+            if (
+                float(candidate[-1]["end"]) - cue_end <= 2.0
+                and pattern.fullmatch(" ".join(word["normalized"] for word in candidate))
+                and len(candidate) > len(best)
+            ):
+                best = candidate
+    return best
+
+
+def interval_levels_dbfs(
+    wav_path: Path, intervals: list[tuple[float, float]], source_offset: float
+) -> list[float]:
+    levels = []
+    with wave.open(str(wav_path), "rb") as audio:
+        if audio.getnchannels() != 1 or audio.getsampwidth() != 2:
+            raise SystemExit("production-interruption analysis expects mono 16-bit PCM channels")
+        rate = audio.getframerate()
+        for source_start, source_end in intervals:
+            local_start = max(0.0, source_start - source_offset)
+            local_end = max(local_start, source_end - source_offset)
+            audio.setpos(min(audio.getnframes(), round(local_start * rate)))
+            frames = max(1, min(audio.getnframes() - audio.tell(), round((local_end - local_start) * rate)))
+            samples = array.array("h", audio.readframes(frames))
+            if sys.byteorder != "little":
+                samples.byteswap()
+            rms = math.sqrt(sum(value * value for value in samples) / max(1, len(samples)))
+            levels.append(dbfs(rms) if rms else -120.0)
+    return [float(level) for level in levels]
+
+
+def quiet_brackets(
+    start: float, end: float, quiet_intervals: list[tuple[float, float]]
+) -> tuple[tuple[float, float], tuple[float, float]] | None:
+    left = [
+        interval
+        for interval in quiet_intervals
+        if start - 0.8 <= interval[1] <= start + 0.2 and interval[0] < start
+    ]
+    right = [
+        interval
+        for interval in quiet_intervals
+        if end - 0.2 <= interval[0] <= end + 0.8 and interval[1] > end
+    ]
+    if not left or not right:
+        return None
+    brackets = max(left, key=lambda item: item[1]), min(right, key=lambda item: item[0])
+    return brackets if brackets[0][1] < brackets[1][0] else None
+
+
+def production_section(project: dict, start: float, end: float) -> dict | None:
+    matches = []
+    for section in project.get("layout_sections", []):
+        try:
+            if float(section["source_start"]) <= start and end <= float(section["source_end"]):
+                matches.append(section)
+        except (KeyError, TypeError, ValueError):
+            continue
+    return matches[0] if len(matches) == 1 else None
+
+
+def production_interruption_decisions(
+    project: dict,
+    words_by_channel: dict[int, list[dict]],
+    channel_wavs: dict[int, Path],
+    fine_quiet_intervals: list[tuple[float, float]],
+    source_offset: float,
+    language: str,
+    level_reader=interval_levels_dbfs,
+) -> list[dict]:
+    raw = []
+    for channel, words in sorted(words_by_channel.items()):
+        index = 0
+        while index < len(words) - 1:
+            match = None
+            for stop in range(index + 2, min(len(words), index + 10) + 1):
+                window = words[index:stop]
+                if window[-1]["end"] - window[0]["start"] > PRODUCTION_INTERRUPTION_MAX_SECONDS:
+                    break
+                tokens = [re.sub(r"[^a-z0-9äöüß]+", "", word["text"].casefold()) for word in window]
+                rule = production_interruption_rule(tokens, language)
+                if rule:
+                    match = {
+                        "channel": channel,
+                        "source_start": float(window[0]["start"]),
+                        "source_end": float(window[-1]["end"]),
+                        "token": " ".join(word["text"] for word in window),
+                        "cue_rule": rule,
+                    }
+                    break
+            if match:
+                raw.append(match)
+                while index < len(words) and words[index]["start"] < match["source_end"]:
+                    index += 1
+            else:
+                index += 1
+
+    groups: list[list[dict]] = []
+    for match in sorted(raw, key=lambda item: (item["source_start"], item["source_end"])):
+        group = next(
+            (
+                items
+                for items in groups
+                if match["source_start"] < max(item["source_end"] for item in items) + 0.35
+                and match["source_end"] > min(item["source_start"] for item in items) - 0.35
+            ),
+            None,
+        )
+        if group is None:
+            group = []
+            groups.append(group)
+        group.append(match)
+
+    all_words = [word for words in words_by_channel.values() for word in words]
+    decisions = []
+    for group in groups:
+        cue_start = min(item["source_start"] for item in group)
+        cue_end = max(item["source_end"] for item in group)
+        acknowledgement = production_acknowledgement(words_by_channel, cue_end, language)
+        cut_end = max([cue_end, *(float(word["end"]) for word in acknowledgement)])
+        channels = sorted({int(item["channel"]) for item in group})
+        primary = channels[0]
+        channel_words = words_by_channel[primary]
+        nearby = [
+            (float(word["start"]), float(word["end"]))
+            for word in channel_words
+            if cue_start - PRODUCTION_INTERRUPTION_LOCAL_WINDOW_SECONDS <= word["start"]
+            and word["end"] <= cue_end + PRODUCTION_INTERRUPTION_LOCAL_WINDOW_SECONDS
+            and (word["end"] <= cue_start or word["start"] >= cue_end)
+            and word not in acknowledgement
+            and word["end"] - word["start"] >= 0.08
+        ]
+        levels = level_reader(channel_wavs[primary], [(cue_start, cue_end), *nearby], source_offset)
+        local_baseline = statistics.median(levels[1:]) if len(levels) >= 5 else None
+        local_mad = (
+            statistics.median(abs(level - local_baseline) for level in levels[1:])
+            if local_baseline is not None
+            else None
+        )
+        relative_level = levels[0] - local_baseline if local_baseline is not None else None
+        relative_threshold = (
+            min(PRODUCTION_INTERRUPTION_RELATIVE_LEVEL_DB, -1.5 * local_mad)
+            if local_mad is not None
+            else PRODUCTION_INTERRUPTION_RELATIVE_LEVEL_DB
+        )
+        brackets = quiet_brackets(cue_start, cut_end, fine_quiet_intervals)
+        cross_channel_cue = len(channels) > 1
+        other_speech = any(
+            word["channel"] not in channels
+            and word not in acknowledgement
+            and word["start"] < cut_end + 0.05
+            and word["end"] > cue_start - 0.05
+            for word in all_words
+        )
+        section = production_section(project, cue_start, cut_end)
+        programme_section = not section or section.get("kind") != "talk" or section.get("layout") != "standard"
+        active_channel = int(section["audio_channel"]) if section and section.get("audio_channel") else None
+        mapped_moderator_channel = active_channel is not None and primary != active_channel
+        relatively_quiet = (
+            relative_level is not None
+            and relative_level <= relative_threshold
+        )
+        auto_eligible = bool(
+            brackets
+            and relatively_quiet
+            and not cross_channel_cue
+            and not other_speech
+            and not programme_section
+            and mapped_moderator_channel
+        )
+        if brackets:
+            left, right = brackets
+            source_start = max(left[0] + 0.02, left[1] - 0.12)
+            source_end = min(right[1] - 0.02, right[0] + 0.12)
+        else:
+            source_start, source_end = cue_start - 0.03, cut_end + 0.03
+        decisions.append(
+            {
+                "source_start": round(max(source_offset, source_start), 3),
+                "source_end": round(source_end, 3),
+                "type": "production_interruption",
+                "action": "review",
+                "status": "suggested",
+                "confidence": round(
+                    min(0.96, 0.72 + 0.08 * bool(brackets) + 0.08 * relatively_quiet), 3
+                ),
+                "auto_eligible": auto_eligible,
+                "semantic_eligible": True,
+                "evidence": {
+                    "channel": primary,
+                    "channels": channels,
+                    "token": max(group, key=lambda item: len(item["token"]))["token"],
+                    "cue_rule": group[0]["cue_rule"],
+                    "acknowledgement": " ".join(
+                        word["text"] for word in acknowledgement
+                    ) or None,
+                    "cue_level_dbfs": round(levels[0], 2),
+                    "local_speech_median_dbfs": round(local_baseline, 2) if local_baseline is not None else None,
+                    "relative_level_db": round(relative_level, 2) if relative_level is not None else None,
+                    "local_level_mad_db": round(local_mad, 2) if local_mad is not None else None,
+                    "relative_level_threshold_db": round(relative_threshold, 2),
+                    "local_window_seconds": PRODUCTION_INTERRUPTION_LOCAL_WINDOW_SECONDS,
+                    "detector_agreement": [
+                        "moderator_time_cue_wording",
+                        *(["locally_quieter_than_speech"] if relatively_quiet else []),
+                        *(["fine_silence_boundaries"] if brackets else []),
+                    ],
+                    "acoustic_speech_island": (
+                        {
+                            "left_quiet": [round(brackets[0][0], 3), round(brackets[0][1], 3)],
+                            "speech": [round(cue_start, 3), round(cut_end, 3)],
+                            "right_quiet": [round(brackets[1][0], 3), round(brackets[1][1], 3)],
+                        }
+                        if brackets
+                        else None
+                    ),
+                    "layout_section": section,
+                    "active_presenter_channel": active_channel,
+                    "mapped_moderator_channel": mapped_moderator_channel,
+                },
+                "guards": {
+                    "overlapping_speech": other_speech,
+                    "cross_channel_cue": cross_channel_cue,
+                    "acoustically_bracketed": bool(brackets),
+                    "locally_quiet": relatively_quiet,
+                    "programme_content_section": programme_section,
+                    "section_context_missing": section is None,
+                    "protected_context": programme_section,
+                    "same_as_active_presenter_channel": not mapped_moderator_channel,
+                },
+                "transition_ms": 45,
+            }
+        )
+    return decisions
 
 
 def stutter_decisions(words_by_channel: dict[int, list[dict]]) -> list[dict]:
@@ -1423,7 +1713,11 @@ def contextualize_decisions(
             role = "unknown"
         else:
             role = "audience" if audience_overlap else "presenter" if start >= presentation_start else "non_presentation"
-        protected = role != "presenter" or speaker_boundary
+        protected = (
+            decision["guards"].get("protected_context", False)
+            or role != "presenter"
+            or speaker_boundary
+        )
         decision["guards"].update(
             {
                 "protected_context": protected,
@@ -1539,7 +1833,11 @@ def semantic_confidence_threshold(decision: dict) -> float:
 def semantic_review(
     decisions: list[dict], project: dict, output: Path, provider: str, source: dict, workers: int
 ) -> dict:
-    candidates = [decision for decision in decisions if decision["auto_eligible"]]
+    candidates = [
+        decision
+        for decision in decisions
+        if decision.get("semantic_eligible", decision["auto_eligible"])
+    ]
     candidate_file = output / "semantic-candidates.json"
     atomic_write_json(candidate_file, candidates)
     slides = project_path(project, "slides_text")
@@ -1632,6 +1930,11 @@ For filler, approve only an isolated non-semantic hesitation. For stutter, appro
 For false_start, approve only abandoned wording that is immediately restarted or corrected without losing content.
 For long_pause, approve only acoustically quiet dead air that is not a demonstration, slide transition, audience wait,
 or rhetorical beat. The deterministic timestamps are fixed: do not propose replacements. Be decisive but factual.
+For production_interruption, approve only a moderator's off-program time warning or wrap-up cue when the transcript
+before and after it reconnects cleanly and preserves the presenter's complete meaning. Reject a presenter discussing
+time as part of the talk, a legitimate introduction/news/discussion/QA contribution, an unclear speaker change, or
+any cue whose removal damages the surrounding sentence. Semantic approval never overrides acoustic, overlap, channel,
+or programme-section guards; review-only candidates remain review-only.
 For candidates whose detector agreement includes stationary_vowel_island or primary_asr_smoothed_material, ordinary
 ASR word timestamps are explicitly known to be smeared across the acoustic island. Do not infer that the interval cuts
 the words named in primary_tokens. Judge the fixed edge from acoustic_speech_island instead: speech ends before the
@@ -1672,19 +1975,29 @@ right_quiet interval, and the proposed cut deliberately ends inside that quiet i
     for decision in candidates:
         item = reviewed.get(decision["id"])
         required_confidence = semantic_confidence_threshold(decision)
-        approved = bool(
+        semantically_approved = bool(
             item
             and item.get("approve") is True
             and float(item["confidence"]) >= required_confidence
             and status != "failed_closed"
         )
+        deterministic_eligible = decision["auto_eligible"]
         decision["evidence"]["semantic_review"] = (
-            {**item, "required_confidence": required_confidence}
+            {
+                **item,
+                "required_confidence": required_confidence,
+                "deterministic_eligible": deterministic_eligible,
+            }
             if item
-            else {"approve": False, "reason": "missing review", "required_confidence": required_confidence}
+            else {
+                "approve": False,
+                "reason": "missing review",
+                "required_confidence": required_confidence,
+                "deterministic_eligible": deterministic_eligible,
+            }
         )
-        decision["auto_eligible"] = approved
-        if approved:
+        decision["auto_eligible"] = semantically_approved and deterministic_eligible
+        if decision["auto_eligible"]:
             decision["action"] = "shorten" if decision["type"] == "long_pause" else "cut"
             decision["confidence"] = round(min(decision["confidence"], float(item["confidence"])), 3)
         else:
@@ -1926,12 +2239,21 @@ def analyze(args: argparse.Namespace) -> None:
         channel_wavs,
         args.start,
     )
+    production_interruptions = production_interruption_decisions(
+        {**project, "layout_sections": timeline.get("layout_sections", [])},
+        words_by_channel,
+        channel_wavs,
+        fine_quiet_intervals,
+        args.start,
+        args.language,
+    )
     decisions = (
         filler_decisions(words_by_channel, SCAN_FILLERS)
         + stutter_decisions(words_by_channel)
         + false_start_decisions(words_by_channel)
         + hidden_decisions
         + acoustic_fillers
+        + production_interruptions
         + pause_decisions(words_by_channel, slide_times, quiet_intervals)
     )
     if args.refine_fillers:
@@ -1976,6 +2298,15 @@ def analyze(args: argparse.Namespace) -> None:
                 "maximum_centroid_cv": 0.23,
                 "candidates": len(acoustic_fillers),
             },
+            "production_interruption": {
+                "engine": "transcript cue + local PCM level + shared-channel silence",
+                "language": args.language,
+                "local_window_seconds": PRODUCTION_INTERRUPTION_LOCAL_WINDOW_SECONDS,
+                "minimum_relative_drop_db": abs(PRODUCTION_INTERRUPTION_RELATIVE_LEVEL_DB),
+                "adaptive_threshold": "max(6 dB, 1.5 x local level MAD)",
+                "maximum_seconds": PRODUCTION_INTERRUPTION_MAX_SECONDS,
+                "candidates": len(production_interruptions),
+            },
             "speaker_context": context,
             "semantic_review": semantic,
         },
@@ -1992,6 +2323,15 @@ def analyze(args: argparse.Namespace) -> None:
                 for item in decisions
             ),
             "acoustic_filler_candidates": len(acoustic_fillers),
+            "production_interruptions": len(production_interruptions),
+            "production_interruptions_applied": sum(
+                item["type"] == "production_interruption" and item["auto_eligible"]
+                for item in decisions
+            ),
+            "production_interruptions_review_only": sum(
+                item["type"] == "production_interruption" and not item["auto_eligible"]
+                for item in decisions
+            ),
             "long_pauses": sum(item["type"] == "long_pause" for item in decisions),
             "auto_eligible": sum(item["auto_eligible"] for item in decisions),
             "applied": sum(item["auto_eligible"] for item in decisions),
@@ -2001,6 +2341,9 @@ def analyze(args: argparse.Namespace) -> None:
             "overlapping_speech_is_never_auto_cut": True,
             "unknown_or_audience_speakers_are_never_auto_cut": True,
             "semantic_approval_is_required": True,
+            "production_interruptions_require_standard_talk_section": True,
+            "production_interruption_cross_channel_cues_are_never_auto_cut": True,
+            "production_interruptions_require_a_mapped_non_presenter_channel": True,
             "semantic_fillers_are_preserved": ["also", "quasi", "eigentlich", "so"],
             "original_is_untouched": True,
         },
@@ -2013,6 +2356,7 @@ def analyze(args: argparse.Namespace) -> None:
         "version": 1,
         "policy": SEMANTIC_POLICY,
         "source": identity,
+        "timeline": content_fingerprint(args.timeline),
         "channel_analysis": channel_analysis,
         "transcripts": transcript_files,
         "edits": approved,
@@ -2143,6 +2487,153 @@ def self_test() -> None:
         ]
     }
     assert len(false_start_decisions(restart_words)) == 1
+    assert production_interruption_rule(["noch", "zwei", "minuten"], "de") == "time_remaining"
+    assert production_interruption_rule(["five", "minutes", "left"], "en-US") == "time_remaining"
+    assert production_interruption_rule(["five", "minutes", "of", "history"], "en") is None
+
+    def cue_word(text: str, start: float, end: float, channel: int = 1) -> dict:
+        return {
+            "text": text,
+            "normalized": normalize_word(text),
+            "start": start,
+            "end": end,
+            "probability": 0.98,
+            "channel": channel,
+        }
+
+    cue_words = {
+        1: [
+            cue_word("Wir", 0.2, 0.4),
+            cue_word("zeigen", 0.5, 0.8),
+            cue_word("den", 1.0, 1.2),
+            cue_word("Ablauf", 1.3, 1.7),
+            cue_word("noch", 3.0, 3.2),
+            cue_word("zwei", 3.25, 3.55),
+            cue_word("Minuten", 3.6, 4.0),
+            cue_word("Danach", 4.4, 4.7),
+            cue_word("geht", 4.8, 5.0),
+            cue_word("es", 5.1, 5.2),
+            cue_word("weiter", 5.3, 5.6),
+        ]
+    }
+    acknowledged = {
+        **cue_words,
+        2: [cue_word("okay", 4.1, 4.35, channel=2)],
+    }
+    assert production_acknowledgement(acknowledged, 4.0, "en")[0]["text"] == "okay"
+    talk_project = {
+        "layout_sections": [
+            {
+                "source_start": 0.0,
+                "source_end": 10.0,
+                "kind": "talk",
+                "layout": "standard",
+                "audio_channel": 2,
+            }
+        ]
+    }
+    quiet = [(2.75, 3.02), (3.98, 4.3)]
+    quiet_level = lambda _path, intervals, _offset: [-32.0] + [-20.0] * (len(intervals) - 1)
+    cue = production_interruption_decisions(
+        talk_project,
+        cue_words,
+        {1: Path("unused.wav")},
+        quiet,
+        0.0,
+        "de",
+        level_reader=quiet_level,
+    )
+    assert len(cue) == 1 and cue[0]["type"] == "production_interruption"
+    assert cue[0]["auto_eligible"] and cue[0]["semantic_eligible"]
+    assert cue[0]["evidence"]["relative_level_db"] == -12.0
+    same_channel = production_interruption_decisions(
+        {"layout_sections": [{**talk_project["layout_sections"][0], "audio_channel": 1}]},
+        cue_words,
+        {1: Path("unused.wav")},
+        quiet,
+        0.0,
+        "de",
+        level_reader=quiet_level,
+    )
+    assert not same_channel[0]["auto_eligible"]
+    assert same_channel[0]["guards"]["same_as_active_presenter_channel"]
+    missing_section = production_interruption_decisions(
+        {}, cue_words, {1: Path("unused.wav")}, quiet, 0.0, "de", level_reader=quiet_level
+    )
+    assert not missing_section[0]["auto_eligible"]
+    assert missing_section[0]["guards"]["section_context_missing"]
+    with tempfile.TemporaryDirectory() as directory, patch.object(
+        sys.modules[__name__],
+        "run_structured_model",
+        return_value={
+            "decisions": [
+                {"id": "audio-0001", "approve": True, "confidence": 1.0, "reason": "context reconnects"}
+            ]
+        },
+    ):
+        review_only = {**missing_section[0], "id": "audio-0001"}
+        semantic_review(
+            [review_only],
+            {"_project_dir": directory, "language": "de"},
+            Path(directory),
+            "codex",
+            {
+                "path": "source.mp4",
+                "size": 1,
+                "sha256": "source",
+                "video_duration": 10.0,
+                "audio": {},
+                "range": {"start": 0.0, "duration": 10.0},
+            },
+            1,
+        )
+        assert review_only["evidence"]["semantic_review"]["approve"]
+        assert not review_only["auto_eligible"] and review_only["action"] == "review"
+    intro_project = {
+        "layout_sections": [
+            {"source_start": 0.0, "source_end": 10.0, "kind": "intro", "layout": "dual_speaker"}
+        ]
+    }
+    intro = production_interruption_decisions(
+        intro_project,
+        cue_words,
+        {1: Path("unused.wav")},
+        quiet,
+        0.0,
+        "de",
+        level_reader=quiet_level,
+    )
+    assert not intro[0]["auto_eligible"] and intro[0]["guards"]["programme_content_section"]
+    duplicate_channels = {
+        1: cue_words[1],
+        2: [{**word, "channel": 2} for word in cue_words[1]],
+    }
+    duplicate = production_interruption_decisions(
+        talk_project,
+        duplicate_channels,
+        {1: Path("unused.wav"), 2: Path("unused.wav")},
+        quiet,
+        0.0,
+        "de",
+        level_reader=quiet_level,
+    )
+    assert len(duplicate) == 1 and not duplicate[0]["auto_eligible"]
+    assert duplicate[0]["guards"]["cross_channel_cue"]
+    overlapping_words = {
+        **cue_words,
+        2: [cue_word("weiterreden", 3.3, 3.8, 2)],
+    }
+    overlapping_cue = production_interruption_decisions(
+        talk_project,
+        overlapping_words,
+        {1: Path("unused.wav"), 2: Path("unused.wav")},
+        quiet,
+        0.0,
+        "de",
+        level_reader=quiet_level,
+    )
+    assert not overlapping_cue[0]["auto_eligible"]
+    assert overlapping_cue[0]["guards"]["overlapping_speech"]
     smoothed_words = [
         {
             "text": text,
@@ -2253,6 +2744,8 @@ def self_test() -> None:
             audio.setframerate(16000)
             audio.writeframes(array.array("h", [1000] * 16000).tobytes())
         assert analyze_channels(mono)["render_policy"] == "process_once_then_duplicate_to_stereo"
+        measured = interval_levels_dbfs(mono, [(0.0, 0.5), (0.5, 1.0)], 0.0)
+        assert max(measured) - min(measured) < 0.01 and -31 < measured[0] < -30
         video = Path(directory) / "source.mp4"
         video.write_bytes(b"talk range source")
         reviewed = Path(directory) / "reviewed.json"
