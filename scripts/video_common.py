@@ -7,6 +7,7 @@ import json
 import math
 import os
 import platform
+import re
 import shlex
 import shutil
 import subprocess
@@ -567,6 +568,177 @@ def validate_timeline(timeline: dict) -> None:
     if website_until < 0 or any(time_value < 0 or time_value >= duration for time_value in times):
         raise SystemExit("timeline events must stay inside its duration")
 
+    participants = timeline.get("participants", {})
+    if not isinstance(participants, dict):
+        raise SystemExit("timeline participants must be an object")
+    source_width = float(timeline.get("source_width", 3840))
+    source_height = float(timeline.get("source_height", 2160))
+    if not math.isfinite(source_width) or not math.isfinite(source_height) or min(
+        source_width, source_height
+    ) <= 0:
+        raise SystemExit("timeline source geometry must be positive")
+    for name, participant in participants.items():
+        if (
+            not isinstance(name, str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", name)
+            or not isinstance(participant, dict)
+        ):
+            raise SystemExit("timeline participant names and definitions must be non-empty")
+        try:
+            track = participant["track"]
+            crop = participant["crop"]
+            width = float(crop["width"])
+            height = float(crop["height"])
+            y = float(crop["y"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit(f"timeline participant {name!r} has invalid track or crop") from error
+        if (
+            not isinstance(track, str)
+            or not track
+            or any(not math.isfinite(value) for value in (width, height, y))
+            or width <= 0
+            or height <= 0
+            or width > source_width
+            or y < 0
+            or y + height > source_height + 1e-6
+        ):
+            raise SystemExit(f"timeline participant {name!r} crop is outside the source")
+        audio_channel = participant.get("audio_channel")
+        if audio_channel is not None and (
+            isinstance(audio_channel, bool)
+            or not isinstance(audio_channel, int)
+            or audio_channel < 1
+        ):
+            raise SystemExit(f"timeline participant {name!r} has an invalid audio channel")
+
+    sections = timeline.get("layout_sections", [])
+    if not isinstance(sections, list):
+        raise SystemExit("timeline layout_sections must be an array")
+    previous_end = 0.0
+    kinds = {"talk", "intro", "news", "discussion", "qa", "break"}
+    participant_sides: dict[str, str] = {}
+    for section in sections:
+        try:
+            start = float(section["source_start"])
+            end = float(section["source_end"])
+            layout = section["layout"]
+            kind = section["kind"]
+        except (KeyError, TypeError, ValueError) as error:
+            raise SystemExit("layout sections need numeric bounds, layout, and kind") from error
+        if (
+            not all(math.isfinite(value) for value in (start, end))
+            or start < previous_end - 1e-6
+            or not 0 <= start < end <= duration + 1e-6
+            or layout not in {"standard", "dual_speaker"}
+            or kind not in kinds
+        ):
+            raise SystemExit(f"invalid or overlapping layout section: {section}")
+        if layout == "dual_speaker":
+            left, right = section.get("left"), section.get("right")
+            if left == right or left not in participants or right not in participants:
+                raise SystemExit(f"dual-speaker section has invalid participants: {section}")
+            channels = [participants[name].get("audio_channel") for name in (left, right)]
+            if None not in channels and channels[0] == channels[1]:
+                raise SystemExit(f"dual-speaker participants must use distinct mapped microphones: {section}")
+            if section.get("active") not in {None, "left", "right", "both"}:
+                raise SystemExit(f"dual-speaker section has invalid active side: {section}")
+            for side, name in (("left", left), ("right", right)):
+                if name in participant_sides and participant_sides[name] != side:
+                    raise SystemExit(f"participant {name!r} changes sides between layout sections")
+                participant_sides[name] = side
+        previous_end = end
+
+    if timeline.get("mix_mapped_microphones"):
+        if (
+            not sections
+            or abs(float(sections[0]["source_start"])) > 1e-6
+            or abs(float(sections[-1]["source_end"]) - duration) > 1e-6
+            or any(
+                abs(float(left["source_end"]) - float(right["source_start"])) > 1e-6
+                for left, right in zip(sections, sections[1:])
+            )
+        ):
+            raise SystemExit("reviewed microphone mixing requires complete contiguous layout sections")
+        for section in sections:
+            if section["layout"] == "dual_speaker":
+                if section.get("active") not in {"left", "right", "both"} or any(
+                    participants[section[side]].get("audio_channel") is None
+                    for side in ("left", "right")
+                ):
+                    raise SystemExit("dual microphone mixing requires mapped channels and an active side")
+            else:
+                channel = section.get("audio_channel")
+                if isinstance(channel, bool) or channel not in {1, 2}:
+                    raise SystemExit("standard microphone mixing sections require audio_channel")
+        mix = timeline.get("microphone_mix", {})
+        try:
+            inactive_gain = float(mix.get("inactive_gain", 0.18))
+            both_gain = float(mix.get("both_gain", 0.5))
+            fade_seconds = float(mix.get("fade_seconds", 0.12))
+            integrated_lufs = float(mix.get("integrated_lufs", -18.0))
+            true_peak_db = float(mix.get("true_peak_db", -2.0))
+        except (AttributeError, TypeError, ValueError) as error:
+            raise SystemExit("timeline microphone_mix values must be numeric") from error
+        if (
+            type(mix.get("normalize", True)) is not bool
+            or not 0 <= inactive_gain <= both_gain <= 1
+            or not 0.02 <= fade_seconds <= 1
+            or not -30 <= integrated_lufs <= -10
+            or not -6 <= true_peak_db <= -1
+        ):
+            raise SystemExit("timeline microphone_mix gains or fade are outside safe bounds")
+
+
+def validate_speaker_track(
+    track: object, duration: float, crop: dict, source_width: float, *, visibility: bool = False
+) -> None:
+    if not isinstance(track, list) or len(track) < 2:
+        raise SystemExit("speaker tracks need at least two samples")
+    try:
+        times = [float(item["time"]) for item in track]
+        positions = [float(item["x"]) for item in track]
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit("speaker tracks need numeric time and x values") from error
+    crop_width = float(crop["width"])
+    if (
+        any(not math.isfinite(value) for value in (*times, *positions))
+        or abs(times[0]) > 1 / 30
+        or (
+            visibility
+            and times[-1] + min(4.0, times[-1] - times[-2] + 1 / 30) < duration
+        )
+        or any(right <= left for left, right in zip(times, times[1:]))
+        or any(x < 0 or x + crop_width > source_width + 1e-6 for x in positions)
+    ):
+        raise SystemExit("speaker track does not cover the timeline or leaves the source frame")
+    if visibility and any(type(item.get("visible")) is not bool for item in track):
+        raise SystemExit("participant tracks require reviewed boolean visibility on every sample")
+    if visibility:
+        for item in track:
+            if not item["visible"]:
+                continue
+            box = item.get("box")
+            if (
+                not isinstance(box, list)
+                or len(box) != 4
+                or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in box)
+                or any(not math.isfinite(float(value)) for value in box)
+                or box[0] < 0
+                or box[1] < 0
+                or box[2] <= 0
+                or box[3] <= 0
+                or box[0] + box[2] > 1 + 1e-6
+                or box[1] + box[3] > 1 + 1e-6
+            ):
+                raise SystemExit("visible participant samples require reviewed normalized boxes")
+
+
+def participant_track_paths(project: dict, timeline: dict) -> dict[str, Path]:
+    return {
+        name: resolve_project_path(project, participant["track"])
+        for name, participant in timeline.get("participants", {}).items()
+    }
+
 
 def analysis_range_matches(source: dict, start: float, end: float) -> bool:
     try:
@@ -602,6 +774,10 @@ def privacy_artifact_identity(project: dict) -> dict:
         "speaker_track": content_fingerprint(
             resolve_project_path(project, timeline["speaker_track"])
         ),
+        "participant_tracks": {
+            name: content_fingerprint(path)
+            for name, path in participant_track_paths(project, timeline).items()
+        },
         "privacy_mask": content_fingerprint(project_path(project, "privacy_mask")),
         "full_blur_mask": content_fingerprint(project_path(project, "full_blur_mask")),
         "detector": {

@@ -4,6 +4,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -12,6 +13,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
+import numpy as np
 from PIL import Image, ImageDraw
 
 from video_common import atomic_write_json, atomic_write_text
@@ -31,7 +33,10 @@ def make_video(path: Path) -> None:
         "-f", "lavfi", "-i", f"testsrc2=size=1920x1080:rate=30:duration={DURATION}",
         "-f", "lavfi", "-i",
         f"aevalsrc=0.15*sin(2*PI*440*t)|0.15*sin(2*PI*660*t):s=48000:d={DURATION}",
-        "-vf", r"settb=expr=1/90000,setpts=floor(N/2)*6000+mod(N\,2)*900",
+        "-vf",
+        r"drawbox=x=40:y=120:w=360:h=840:color=blue:t=fill,"
+        r"drawbox=x=1520:y=120:w=360:h=840:color=yellow:t=fill:enable='not(between(t\,1.5\,2.5))',"
+        r"settb=expr=1/90000,setpts=floor(N/2)*6000+mod(N\,2)*900",
         "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
         "-fps_mode", "passthrough", "-enc_time_base:v", "demux",
         "-c:a", "aac", "-ac", "2", str(path),
@@ -55,10 +60,10 @@ def make_mask(path: Path, color: str, white_interval: tuple[float, float] | None
     )
 
 
-def sample_pixel(path: Path, x: int, y: int) -> tuple[int, int, int]:
+def sample_pixel(path: Path, x: int, y: int, timestamp: float = 0.1) -> tuple[int, int, int]:
     frame = subprocess.run(
         [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", "0.1", "-i", str(path),
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", str(timestamp), "-i", str(path),
             "-vf", f"crop=2:2:{x}:{y},format=rgb24", "-frames:v", "1", "-f", "rawvideo", "-",
         ],
         check=True,
@@ -100,6 +105,22 @@ def fixture(directory: Path) -> Path:
         [{"time": 0.0, "x": 0.0}, {"time": DURATION, "x": 0.0}],
     )
     atomic_write_json(
+        directory / "build/host-a-track.json",
+        [
+            {"time": 0.0, "x": 0.0, "visible": True, "box": [0.02, 0.1, 0.19, 0.78]},
+            {"time": DURATION, "x": 0.0, "visible": True, "box": [0.02, 0.1, 0.19, 0.78]},
+        ],
+    )
+    atomic_write_json(
+        directory / "build/host-b-track.json",
+        [
+            {"time": 0.0, "x": 1520.0, "visible": True, "box": [0.79, 0.1, 0.19, 0.78]},
+            {"time": 1.5, "x": 1520.0, "visible": False, "box": None},
+            {"time": 2.5, "x": 1520.0, "visible": True, "box": [0.79, 0.1, 0.19, 0.78]},
+            {"time": DURATION, "x": 1520.0, "visible": True, "box": [0.79, 0.1, 0.19, 0.78]},
+        ],
+    )
+    atomic_write_json(
         directory / "build/timeline.json",
         {
             "duration": DURATION,
@@ -110,6 +131,47 @@ def fixture(directory: Path) -> Path:
             "source_height": 1080,
             "speaker_crop": {"width": 864, "height": 1080, "y": 0},
             "screen_crop": {"x": 0, "y": 0, "width": 1920, "height": 1080},
+            "participants": {
+                "host_a": {
+                    "track": "build/host-a-track.json",
+                    "crop": {"width": 400, "height": 1080, "y": 0},
+                    "audio_channel": 1,
+                },
+                "host_b": {
+                    "track": "build/host-b-track.json",
+                    "crop": {"width": 400, "height": 1080, "y": 0},
+                    "audio_channel": 2,
+                },
+            },
+            "layout_sections": [
+                {
+                    "source_start": 0.0,
+                    "source_end": 2.0,
+                    "kind": "intro",
+                    "layout": "dual_speaker",
+                    "left": "host_a",
+                    "right": "host_b",
+                    "active": "left",
+                },
+                {
+                    "source_start": 2.0,
+                    "source_end": 2.5,
+                    "kind": "talk",
+                    "layout": "standard",
+                    "audio_channel": 1,
+                },
+                {
+                    "source_start": 2.5,
+                    "source_end": DURATION,
+                    "kind": "discussion",
+                    "layout": "dual_speaker",
+                    "left": "host_a",
+                    "right": "host_b",
+                    "active": "right",
+                },
+            ],
+            "mix_mapped_microphones": True,
+            "microphone_mix": {"inactive_gain": 0.18, "both_gain": 0.5, "fade_seconds": 0.12},
         },
     )
     atomic_write_json(
@@ -376,19 +438,30 @@ def main() -> None:
             try:
                 meetup_video.check(loaded_project, project)
             except SystemExit as error:
-                assert "timeline duration" in str(error)
+                assert "timeline" in str(error) or "layout section" in str(error)
             else:
                 raise AssertionError("stale timeline duration must fail")
         atomic_write_json(timeline_path, timeline)
         with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
             meetup_video.check(loaded_project, project)
         run(*command, "preview", "--duration", str(DURATION))
+        preview = project.parent / "output/debug/previews/preview-1080p.mp4"
         run(
             *command,
             "validate",
             "--input",
-            str(project.parent / "output/debug/previews/preview-1080p.mp4"),
+            str(preview),
         )
+        left = sample_pixel(preview, 170, 540, 0.8)
+        center = sample_pixel(preview, 960, 540, 0.8)
+        right = sample_pixel(preview, 1730, 540, 0.8)
+        assert left[2] > left[0] + 30 and left[2] > left[1] + 30, left
+        assert center[0] > center[1] + 100 and center[0] > center[2] + 100, center
+        assert min(right[:2]) > right[2] + 40, right
+        absent = sample_pixel(preview, 1730, 540, 2.05)
+        assert max(absent) - min(absent) < 20 and max(absent) < 80, absent
+        returned = sample_pixel(preview, 1730, 540, 3.05)
+        assert min(returned[:2]) > returned[2] + 40, returned
         late_preview = project.parent / "output/debug/previews/late-slide.mp4"
         relative_late_preview = os.path.relpath(late_preview, Path.cwd())
         run(
@@ -400,6 +473,19 @@ def main() -> None:
         unapproved = subprocess.run([*command, "final"], capture_output=True, text=True)
         assert unapproved.returncode and "not explicitly approved" in unapproved.stderr
         run(*command, "approve")
+        participant_track = project.parent / "build/host-b-track.json"
+        approved_track = participant_track.read_bytes()
+        participant_track.write_bytes(approved_track + b" ")
+        stale = subprocess.run([*command, "final"], capture_output=True, text=True)
+        assert stale.returncode and "preview approval is missing or stale" in stale.stderr
+        with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
+            try:
+                meetup_video.check(loaded_project, project)
+            except SystemExit as error:
+                assert "privacy provenance is stale" in str(error)
+            else:
+                raise AssertionError("participant-track changes must invalidate privacy review")
+        participant_track.write_bytes(approved_track)
         edl = project.parent / "final-edits.json"
         approved_edl = edl.read_bytes()
         edl.write_bytes(approved_edl + b" ")
@@ -420,6 +506,18 @@ def main() -> None:
             )
         run(*command, "validate", "--resolution", "1920x1080")
         final = project.parent / "output/final/final.mp4"
+        decoded_audio = subprocess.run(
+            [
+                "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", str(final),
+                "-map", "0:a:0", "-f", "s16le", "-acodec", "pcm_s16le", "-",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        samples = np.frombuffer(decoded_audio, dtype=np.int16).reshape(-1, 2)
+        assert np.corrcoef(samples[:, 0], samples[:, 1])[0, 1] > 0.999
+        peak_db = 20 * math.log10(np.max(np.abs(samples.astype(np.int32))) / 32768)
+        assert peak_db <= -1.5, peak_db
         level = subprocess.run(
             [
                 "ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",

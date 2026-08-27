@@ -31,6 +31,7 @@ from video_common import (
     file_sha256,
     host_capabilities,
     optional_project_path,
+    participant_track_paths,
     presentation_bounds,
     privacy_artifact_identity,
     privacy_provenance_path,
@@ -44,6 +45,7 @@ from video_common import (
     source_to_output,
     speaker_position,
     validate_timeline,
+    validate_speaker_track,
 )
 
 
@@ -303,6 +305,10 @@ def render_identity(project: dict) -> dict:
     }
     speaker_track = resolve_project_path(project, timeline["speaker_track"])
     files["speaker_track"] = fingerprint("speaker-track", speaker_track)
+    files["participant_tracks"] = {
+        name: fingerprint(f"participant-track-{name}", path)
+        for name, path in participant_track_paths(project, timeline).items()
+    }
     files["renderer"] = fingerprint("renderer", ROOT / "scripts/render-video.py")
     files["controller"] = fingerprint("controller", Path(__file__).resolve())
     files["common"] = fingerprint("common", ROOT / "scripts/video_common.py")
@@ -394,7 +400,7 @@ def validate_render(
             "-v",
             "error",
             "-show_entries",
-            "stream=codec_type,width,height,channels:format=duration",
+            "stream=codec_type,width,height,channels,duration:format=duration",
             "-of",
             "json",
             str(path),
@@ -415,6 +421,12 @@ def validate_render(
         raise SystemExit("invalid render: expected two audio channels")
 
     seconds = float(probe["format"]["duration"])
+    try:
+        av_delta = abs(float(video["duration"]) - float(audio["duration"]))
+    except (KeyError, TypeError, ValueError):
+        av_delta = None
+    if av_delta is not None and av_delta > 1 / 30 + 0.005:
+        raise SystemExit(f"invalid render: audio/video duration delta is {av_delta:.3f}s")
     if expected_duration is not None and abs(seconds - expected_duration) > 0.25:
         raise SystemExit(
             f"invalid render: duration is {seconds:.3f}s, expected {expected_duration:.3f}s"
@@ -445,7 +457,11 @@ def validate_render(
         visible += sum(pixel >= 16 for pixel in frame.stdout) >= len(frame.stdout) // 20
     if visible != 3:
         raise SystemExit(f"invalid render: {3 - visible} of 3 sampled frames are black")
-    print(f"validated render: {expected_resolution}, stereo, {seconds:.3f}s, three visible sample frames")
+    sync = f", A/V delta {av_delta * 1000:.1f}ms" if av_delta is not None else ""
+    print(
+        f"validated render: {expected_resolution}, stereo, {seconds:.3f}s{sync}, "
+        "three visible sample frames"
+    )
     return seconds
 
 
@@ -576,18 +592,19 @@ def validate_privacy_samples(
     samples: list[tuple[float, float]],
 ) -> int:
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
-    track = json.loads(
+    primary_track = json.loads(
         resolve_project_path(project, timeline["speaker_track"]).read_text(encoding="utf-8")
     )
+    participant_tracks = {
+        name: json.loads(path.read_text(encoding="utf-8"))
+        for name, path in participant_track_paths(project, timeline).items()
+    }
     output_width, output_height = map(int, resolution.split("x"))
     source_width = float(timeline.get("source_width", 3840))
     if source_width <= 0:
         raise SystemExit("timeline source_width must be positive")
     layout_scale = output_width / 3840
     source_scale = output_width / source_width
-    crop = timeline["speaker_crop"]
-    panel = tuple(round(value * layout_scale) for value in (91, 296, 864, 1536))
-    actual_filter = f"crop={panel[2]}:{panel[3]}:{panel[0]}:{panel[1]},scale=216:384"
     conclusive = 0
     passed = 0
     contrasts = []
@@ -595,39 +612,78 @@ def validate_privacy_samples(
     if len(samples) > 720:
         raise SystemExit("privacy mask is too fragmented for bounded artifact validation")
     for source_time, output_time in samples:
-        position = speaker_position(track, source_time)
-        crop_filter = (
-            f"crop={round(crop['width'] * source_scale)}:{round(crop['height'] * source_scale)}:"
-            f"{position[0] * source_scale:.3f}:{round(crop['y'] * source_scale)},"
-            f"scale={panel[2]}:{panel[3]},scale=216:384"
+        section = next(
+            (
+                item
+                for item in timeline.get("layout_sections", [])
+                if item["layout"] == "dual_speaker"
+                and float(item["source_start"]) <= source_time < float(item["source_end"])
+            ),
+            None,
         )
-        clean = gray_frame(
-            project_path(project, "video"), source_time,
-            f"scale={output_width}:{output_height},{crop_filter}",
-        )
-        blurred = gray_frame(
-            project_path(project, "video"), source_time,
-            f"scale={output_width}:{output_height},scale=960:540,boxblur=24:2,"
-            f"scale={output_width}:{output_height}:flags=bilinear,{crop_filter}",
-        )
-        clean_energy = high_frequency_energy(clean)
-        blurred_energy = high_frequency_energy(blurred)
-        contrasts.append(clean_energy - blurred_energy)
-        if clean_energy - blurred_energy < 0.15:
-            continue
-        conclusive += 1
-        actual = gray_frame(
-            path,
-            output_time,
-            actual_filter,
-        )
-        actual_energy = high_frequency_energy(actual)
-        if actual_energy <= blurred_energy + 0.5 * (clean_energy - blurred_energy) + 0.1:
-            passed += 1
+        panels = []
+        if section:
+            for side, x in (("left", 60), ("right", 3140)):
+                name = section[side]
+                track = participant_tracks[name]
+                visible = next(
+                    (
+                        bool(item["visible"])
+                        for item in reversed(track)
+                        if float(item["time"]) <= source_time
+                    ),
+                    False,
+                )
+                if visible:
+                    panels.append(
+                        (
+                            timeline["participants"][name]["crop"],
+                            track,
+                            tuple(round(value * layout_scale) for value in (x, 511, 640, 1138)),
+                        )
+                    )
         else:
-            raise SystemExit(
-                f"invalid render privacy: frame at source {source_time:.3f}s is not blurred"
+            panels.append(
+                (
+                    timeline["speaker_crop"],
+                    primary_track,
+                    tuple(round(value * layout_scale) for value in (91, 296, 864, 1536)),
+                )
             )
+        for crop, track, panel in panels:
+            position = speaker_position(track, source_time)
+            crop_filter = (
+                f"crop={round(crop['width'] * source_scale)}:{round(crop['height'] * source_scale)}:"
+                f"{position[0] * source_scale:.3f}:{round(crop['y'] * source_scale)},"
+                f"scale={panel[2]}:{panel[3]},scale=216:384"
+            )
+            clean = gray_frame(
+                project_path(project, "video"), source_time,
+                f"scale={output_width}:{output_height},{crop_filter}",
+            )
+            blurred = gray_frame(
+                project_path(project, "video"), source_time,
+                f"scale={output_width}:{output_height},scale=960:540,boxblur=24:2,"
+                f"scale={output_width}:{output_height}:flags=bilinear,{crop_filter}",
+            )
+            clean_energy = high_frequency_energy(clean)
+            blurred_energy = high_frequency_energy(blurred)
+            contrasts.append(clean_energy - blurred_energy)
+            if clean_energy - blurred_energy < 0.15:
+                continue
+            conclusive += 1
+            actual = gray_frame(
+                path,
+                output_time,
+                f"crop={panel[2]}:{panel[3]}:{panel[0]}:{panel[1]},scale=216:384",
+            )
+            actual_energy = high_frequency_energy(actual)
+            if actual_energy <= blurred_energy + 0.5 * (clean_energy - blurred_energy) + 0.1:
+                passed += 1
+            else:
+                raise SystemExit(
+                    f"invalid render privacy: frame at source {source_time:.3f}s is not blurred"
+                )
     if not conclusive:
         raise SystemExit(
             "invalid render privacy: no visually conclusive full-blur sample "
@@ -691,6 +747,7 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
     if not source_audio or int(source_audio.get("channels", 0)) not in {1, 2}:
         channels = source_audio.get("channels", "missing") if source_audio else "missing"
         raise SystemExit(f"source video must contain mono or stereo audio; found {channels} channels")
+    source_channel_count = int(source_audio["channels"])
     media_seconds = float(source_probe["format"]["duration"])
     presentation_start, presentation_end = presentation_bounds(project, media_seconds)
     final_edits = json.loads(project_path(project, "edl").read_text(encoding="utf-8")).get("edits", [])
@@ -721,6 +778,8 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
             )
         ):
             raise SystemExit("audio edit artifact is stale for the configured talk range")
+        if audio_edits.get("timeline") != content_fingerprint(project_path(project, "timeline")):
+            raise SystemExit("audio edit artifact is stale for the configured timeline")
         channels = audio_edits.get("channel_analysis", {})
         audio_render_policy(audio_edits)
         print(
@@ -742,12 +801,34 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
 
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
     validate_timeline(timeline)
+    if any(
+        int(participant.get("audio_channel") or 1) > source_channel_count
+        for participant in timeline.get("participants", {}).values()
+    ):
+        raise SystemExit("participant microphone mapping exceeds the source audio channels")
     source_seconds = float(timeline["duration"])
     if abs(source_seconds - media_seconds) > 1 / 30:
         raise SystemExit(
             f"timeline duration is {source_seconds:.3f}s, source video is {media_seconds:.3f}s"
         )
     start, presentation_end = presentation_bounds(project, source_seconds)
+    source_width = float(timeline.get("source_width", 3840))
+    primary_track = json.loads(
+        resolve_project_path(project, timeline["speaker_track"]).read_text(encoding="utf-8")
+    )
+    validate_speaker_track(
+        primary_track, source_seconds, timeline["speaker_crop"], source_width
+    )
+    for name, path in participant_track_paths(project, timeline).items():
+        if not path.exists():
+            raise SystemExit(f"missing participant track {name!r}: {path}")
+        validate_speaker_track(
+            json.loads(path.read_text(encoding="utf-8")),
+            source_seconds,
+            timeline["participants"][name]["crop"],
+            source_width,
+            visibility=True,
+        )
     expected = presentation_end - start
     for key in ("privacy_mask", "full_blur_mask"):
         actual = duration(project_path(project, key))
@@ -808,9 +889,8 @@ def render(
         check(project, project_file, final=True)
     resolution = project.get("final_resolution", "3840x2160") if final else "1920x1080"
     edits, faq = timeline_data(project)
-    timeline_duration = float(
-        json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))["duration"]
-    )
+    timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
+    timeline_duration = float(timeline["duration"])
     presentation_start, presentation_end = presentation_bounds(project, timeline_duration)
     if start < presentation_start or start >= presentation_end:
         raise SystemExit("render start must stay inside the presentation range")
@@ -833,6 +913,8 @@ def render(
         )
         if source_audio and int(source_audio.get("channels", 0)) == 1:
             audio_policy = "process_once_then_duplicate_to_stereo"
+    if timeline.get("mix_mapped_microphones"):
+        audio_policy = "mix_reviewed_microphones_to_stereo"
     encoder = host_capabilities(project)["video_encoder"]["name"]
     preset = project.get("final_preset" if final else "preview_preset", "ultrafast")
     command = [

@@ -23,6 +23,63 @@ def smooth_positions(values: list[float]) -> list[float]:
     ]
 
 
+def stable_visibility(
+    times: list[float], detected: list[bool], dropout_hold: float, reacquire: float
+) -> list[bool]:
+    visible = detected[:]
+    index = 0
+    while index < len(visible):
+        if visible[index]:
+            index += 1
+            continue
+        end = index
+        while end < len(visible) and not visible[end]:
+            end += 1
+        if index and end < len(visible) and times[end] - times[index - 1] <= dropout_hold:
+            visible[index:end] = [True] * (end - index)
+        index = end
+    detected_after_hold = visible[:]
+    index = 1
+    while index < len(visible):
+        if not detected_after_hold[index] or detected_after_hold[index - 1]:
+            index += 1
+            continue
+        end = index
+        while end < len(visible) and detected_after_hold[end]:
+            if times[end] - times[index] < reacquire:
+                visible[end] = False
+            end += 1
+        index = end
+    return visible
+
+
+def fill_visible_boxes(positions: list[dict], visibility: list[bool]) -> None:
+    for index, (item, visible) in enumerate(zip(positions, visibility, strict=True)):
+        if not visible or item["box"] is not None:
+            continue
+        left = next(
+            (positions[candidate] for candidate in range(index - 1, -1, -1) if positions[candidate]["box"]),
+            None,
+        )
+        right = next(
+            (
+                positions[candidate]
+                for candidate in range(index + 1, len(positions))
+                if positions[candidate]["box"]
+            ),
+            None,
+        )
+        if not left or not right:
+            raise SystemExit("held participant visibility has no detections on both sides")
+        span = float(right["time"]) - float(left["time"])
+        ratio = (float(item["time"]) - float(left["time"])) / span
+        item["box"] = [
+            round(float(a) + (float(b) - float(a)) * ratio, 6)
+            for a, b in zip(left["box"], right["box"], strict=True)
+        ]
+        item["box_source"] = "interpolated_short_dropout"
+
+
 def prepare(samples: Path, output: Path, step: float) -> None:
     frames = sorted(samples.glob("frame-*.jpg"))
     if not frames:
@@ -34,7 +91,15 @@ def prepare(samples: Path, output: Path, step: float) -> None:
     print(f"{len(frames)} frames -> {output}")
 
 
-def build(detections: Path, output: Path, source_width: int, crop_width: int) -> None:
+def build(
+    detections: Path,
+    output: Path,
+    source_width: int,
+    crop_width: int,
+    track_visibility: bool = False,
+    dropout_hold: float = 1.0,
+    reacquire: float = 1.0,
+) -> None:
     positions: list[dict[str, float]] = []
     visibility_limits: list[tuple[float, float] | None] = []
     previous_center: float | None = None
@@ -48,13 +113,16 @@ def build(detections: Path, output: Path, source_width: int, crop_width: int) ->
                 continue
             x, _y, width, height = map(float, item.split(","))
             if height >= 0.12:
-                boxes.append((x + width / 2, width, height / max(width, 0.01)))
+                boxes.append(
+                    (x + width / 2, width, height / max(width, 0.01), [x, _y, width, height])
+                )
 
+        selected_box = None
         if boxes:
             if previous_center is None:
-                center, width, _ = max(boxes, key=lambda item: item[2])
+                center, width, _, selected_box = max(boxes, key=lambda item: item[2])
             else:
-                center, width, _ = min(
+                center, width, _, selected_box = min(
                     boxes,
                     key=lambda item: abs(item[0] - previous_center)
                     + 0.35 * abs(item[1] - (previous_width or item[1]))
@@ -77,7 +145,7 @@ def build(detections: Path, output: Path, source_width: int, crop_width: int) ->
             previous_center = 0.5
         target = previous_center * source_width - crop_width / 2
         target = max(0.0, min(source_width - crop_width, target))
-        positions.append({"time": float(timestamp), "x": target})
+        positions.append({"time": float(timestamp), "x": target, "box": selected_box})
 
     raw = [item["x"] for item in positions]
     cleaned = raw[:]
@@ -94,6 +162,18 @@ def build(detections: Path, output: Path, source_width: int, crop_width: int) ->
             if lower <= upper:
                 value = max(lower, min(upper, value))
         item["x"] = round(value, 2)
+
+    if track_visibility:
+        times = [float(item["time"]) for item in positions]
+        visibility = stable_visibility(
+            times, [item["box"] is not None for item in positions], dropout_hold, reacquire
+        )
+        fill_visible_boxes(positions, visibility)
+        for item, visible in zip(positions, visibility, strict=True):
+            item["visible"] = visible
+    else:
+        for item in positions:
+            item.pop("box", None)
 
     atomic_write_json(output, positions)
     print(f"{len(positions)} tracked positions -> {output}")
@@ -113,16 +193,36 @@ def main() -> None:
     track.add_argument("output", type=Path)
     track.add_argument("--source-width", type=int, default=3840)
     track.add_argument("--crop-width", type=int, default=1080)
+    track.add_argument("--track-visibility", action="store_true")
+    track.add_argument("--dropout-hold", type=float, default=1.0)
+    track.add_argument("--reacquire", type=float, default=1.0)
 
     subparsers.add_parser("self-test")
 
     args = parser.parse_args()
     if args.command == "self-test":
         assert smooth_positions([10.0] * 9) == [10.0] * 9
+        assert stable_visibility([0, 0.5, 1.0], [True, False, True], 1.1, 0.0) == [True] * 3
+        assert stable_visibility([0, 0.5, 1.0], [False, True, True], 0.0, 0.5) == [False, False, True]
+        held = [
+            {"time": 0.0, "box": [0.0, 0.0, 0.1, 0.5]},
+            {"time": 0.5, "box": None},
+            {"time": 1.0, "box": [0.2, 0.0, 0.1, 0.5]},
+        ]
+        fill_visible_boxes(held, [True, True, True])
+        assert held[1]["box"] == [0.1, 0.0, 0.1, 0.5]
     elif args.command == "prepare":
         prepare(args.samples, args.output, args.step)
     else:
-        build(args.detections, args.output, args.source_width, args.crop_width)
+        build(
+            args.detections,
+            args.output,
+            args.source_width,
+            args.crop_width,
+            args.track_visibility,
+            args.dropout_hold,
+            args.reacquire,
+        )
 
 
 if __name__ == "__main__":

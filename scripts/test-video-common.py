@@ -33,6 +33,7 @@ from video_common import (
     source_to_output,
     timeline_events_in_range,
     validate_timeline,
+    validate_speaker_track,
     whisper_tokens,
 )
 
@@ -55,6 +56,59 @@ assert timeline_events_in_range(14, 1, edits, faq) == []
 assert build_time_map(3, [{"source_start": 1, "source_end": 2}])["output_duration"] == 2
 valid_timeline = {"duration": 10, "website_until": 1, "slides": [{"time": 1}, {"time": 5}]}
 validate_timeline(valid_timeline)
+dual_timeline = {
+    **valid_timeline,
+    "source_width": 1920,
+    "source_height": 1080,
+    "participants": {
+        "host_a": {"track": "host-a.json", "crop": {"width": 400, "height": 900, "y": 90}},
+        "host_b": {"track": "host-b.json", "crop": {"width": 400, "height": 900, "y": 90}},
+    },
+    "layout_sections": [
+        {
+            "source_start": 0,
+            "source_end": 4,
+            "kind": "intro",
+            "layout": "dual_speaker",
+            "left": "host_a",
+            "right": "host_b",
+            "active": "left",
+        },
+        {"source_start": 4, "source_end": 10, "kind": "talk", "layout": "standard"},
+    ],
+}
+validate_timeline(dual_timeline)
+validate_speaker_track(
+    [
+        {"time": 0, "x": 0, "visible": True, "box": [0.05, 0.1, 0.2, 0.8]},
+        {"time": 10, "x": 100, "visible": False},
+    ],
+    10,
+    dual_timeline["participants"]["host_a"]["crop"],
+    1920,
+    visibility=True,
+)
+validate_speaker_track(
+    [{"time": 0, "x": 0}, {"time": 1, "x": 0}],
+    10,
+    {"width": 400},
+    1920,
+)
+try:
+    validate_speaker_track(
+        [
+            {"time": 0, "x": 0, "visible": True, "box": [0.05, 0.1, 0.2, 0.8]},
+            {"time": 1, "x": 0, "visible": True, "box": [0.05, 0.1, 0.2, 0.8]},
+        ],
+        10,
+        {"width": 400},
+        1920,
+        visibility=True,
+    )
+except SystemExit:
+    pass
+else:
+    raise AssertionError("participant visibility tracks must review the timeline tail")
 for invalid_timeline in (
     {**valid_timeline, "slides": [{"time": 5}, {"time": 1}]},
     {**valid_timeline, "slides": [{"time": 1}, {"time": 1}]},
@@ -62,6 +116,35 @@ for invalid_timeline in (
     {**valid_timeline, "slides": [{"time": 1}, {"time": 10}]},
     {**valid_timeline, "slides": [{"time": 1}, {"time": 11}]},
     {**valid_timeline, "slides": [{"time": float("nan")}]},
+    {
+        **dual_timeline,
+        "layout_sections": [
+            dual_timeline["layout_sections"][0],
+            {"source_start": 3, "source_end": 5, "kind": "talk", "layout": "standard"},
+        ],
+    },
+    {
+        **dual_timeline,
+        "layout_sections": [
+            {
+                **dual_timeline["layout_sections"][0],
+                "right": "host_a",
+            }
+        ],
+    },
+    {
+        **valid_timeline,
+        "mix_mapped_microphones": True,
+        "layout_sections": [
+            {
+                "source_start": 0,
+                "source_end": 10,
+                "kind": "talk",
+                "layout": "standard",
+                "audio_channel": 3,
+            }
+        ],
+    },
 ):
     try:
         validate_timeline(invalid_timeline)

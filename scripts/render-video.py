@@ -3,6 +3,7 @@
 import argparse
 import bisect
 import json
+import math
 import subprocess
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from video_common import (
     resolve_project_path,
     source_to_output,
     stabilize_camera_positions,
+    validate_speaker_track,
     validate_timeline,
 )
 
@@ -158,7 +160,12 @@ def make_concat(timeline: dict, slides_dir: Path, output: Path) -> None:
 
 
 def make_speaker_commands(
-    track_file: Path, output: Path, start: float, duration: float, position_scale: float = 1.0
+    track_file: Path,
+    output: Path,
+    start: float,
+    duration: float,
+    position_scale: float = 1.0,
+    instance: str = "speaker",
 ) -> float:
     track = json.loads(track_file.read_text(encoding="utf-8"))
     positions = stabilize_camera_positions([float(item["x"]) for item in track])
@@ -211,9 +218,128 @@ def make_speaker_commands(
             f"{current:.4f}+{velocity:.4f}*{delta}+"
             f"{quadratic:.4f}*{delta}^2+{cubic:.4f}*{delta}^3"
         )
-        commands.append(f"{local:.3f} crop@speaker x {expression};")
+        commands.append(f"{local:.3f} crop@{instance} x {expression};")
     atomic_write_text(output, "\n".join(commands) + "\n")
     return first
+
+
+def intersect_intervals(
+    left: list[tuple[float, float]], right: list[tuple[float, float]]
+) -> list[tuple[float, float]]:
+    intersections = []
+    for left_start, left_end in left:
+        for right_start, right_end in right:
+            start, end = max(left_start, right_start), min(left_end, right_end)
+            if end > start:
+                intersections.append((start, end))
+    return intersections
+
+
+def visible_intervals(track: list[dict], duration: float) -> list[tuple[float, float]]:
+    intervals = []
+    for index, item in enumerate(track):
+        start = float(item["time"])
+        end = float(track[index + 1]["time"]) if index + 1 < len(track) else duration
+        if item.get("visible", True) and end > start:
+            if intervals and start <= intervals[-1][1] + 1e-6:
+                intervals[-1] = (intervals[-1][0], end)
+            else:
+                intervals.append((start, end))
+    return intervals
+
+
+def enable_expression(
+    intervals: list[tuple[float, float]], start: float, duration: float
+) -> str:
+    end = start + duration
+    local = [
+        (max(left, start) - start, min(right, end) - start)
+        for left, right in intervals
+        if left < end and right > start
+    ]
+    if not local:
+        return "0"
+    return "+".join(f"between(t,{left:.6f},{right:.6f})" for left, right in local)
+
+
+def microphone_gain_segments(
+    timeline: dict, start: float, duration: float
+) -> dict[int, list[tuple[float, float, float]]]:
+    mix = timeline.get("microphone_mix", {})
+    inactive = float(mix.get("inactive_gain", 0.18))
+    both = float(mix.get("both_gain", 0.5))
+    end = start + duration
+    gains = {1: [], 2: []}
+    for section in timeline.get("layout_sections", []):
+        left = max(start, float(section["source_start"]))
+        right = min(end, float(section["source_end"]))
+        if right <= left:
+            continue
+        levels = {1: inactive, 2: inactive}
+        if section["layout"] == "dual_speaker":
+            participants = timeline["participants"]
+            left_channel = int(participants[section["left"]]["audio_channel"])
+            right_channel = int(participants[section["right"]]["audio_channel"])
+            if section["active"] in {"left", "both"}:
+                levels[left_channel] = both if section["active"] == "both" else 1.0
+            if section["active"] in {"right", "both"}:
+                levels[right_channel] = both if section["active"] == "both" else 1.0
+        else:
+            channel = int(section["audio_channel"])
+            if channel not in gains:
+                raise SystemExit("reviewed microphone mix supports only stereo source channels 1 and 2")
+            levels[channel] = 1.0
+        for channel in gains:
+            gains[channel].append((left - start, right - start, levels[channel]))
+    if any(not segments or abs(segments[0][0]) > 1e-6 or abs(segments[-1][1] - duration) > 1e-6 for segments in gains.values()):
+        raise SystemExit("reviewed microphone mix does not cover the render range")
+    return gains
+
+
+def gain_expression(segments: list[tuple[float, float, float]], fade: float) -> str:
+    def expression(index: int) -> str:
+        gain = segments[index][2]
+        if index + 1 == len(segments):
+            return f"{gain:.6f}"
+        boundary = segments[index][1]
+        next_gain = segments[index + 1][2]
+        left, right = max(0.0, boundary - fade), boundary + fade
+        ramp = f"{gain:.6f}+({next_gain:.6f}-{gain:.6f})*(t-{left:.6f})/{right - left:.6f}"
+        return (
+            f"if(lt(t,{left:.6f}),{gain:.6f},"
+            f"if(lt(t,{right:.6f}),{ramp},{expression(index + 1)}))"
+        )
+
+    return expression(0)
+
+
+def microphone_mix_filter(timeline: dict, start: float, duration: float) -> str:
+    mix = timeline.get("microphone_mix", {})
+    fade = float(mix.get("fade_seconds", 0.12))
+    normalize = mix.get("normalize", True)
+    integrated = float(mix.get("integrated_lufs", -18.0))
+    true_peak = float(mix.get("true_peak_db", -2.0))
+    gains = microphone_gain_segments(timeline, start, duration)
+    filters = ["[0:a:0]channelsplit=channel_layout=stereo[mic1][mic2]"]
+    for channel in (1, 2):
+        chain = f"[mic{channel}]"
+        if normalize:
+            chain += (
+                f"loudnorm=I={integrated:.2f}:LRA=11:TP={true_peak:.2f},"
+                "aresample=48000:async=1:first_pts=0,"
+            )
+        chain += (
+            f"volume='{gain_expression(gains[channel], fade)}':eval=frame,"
+            "pan=stereo|c0=0.70710678*c0|c1=0.70710678*c0"
+            f"[mixed-mic{channel}]"
+        )
+        filters.append(chain)
+    ceiling = 10 ** (true_peak / 20)
+    filters.append(
+        "[mixed-mic1][mixed-mic2]amix=inputs=2:normalize=0:dropout_transition=0,"
+        f"alimiter=limit={ceiling:.8f}:level=0:latency=1[prepareda]"
+    )
+    return ";".join(filters)
 
 
 def main() -> None:
@@ -244,6 +370,7 @@ def main() -> None:
         choices=(
             "process_once_then_duplicate_to_stereo",
             "process_and_preserve_each_channel_separately",
+            "mix_reviewed_microphones_to_stereo",
         ),
         default="process_and_preserve_each_channel_separately",
     )
@@ -268,7 +395,6 @@ def main() -> None:
 
     timeline = json.loads(args.timeline.read_text(encoding="utf-8"))
     validate_timeline(timeline)
-    slides = timeline["slides"]
 
     build = args.timeline.resolve().parent / "render"
     build.mkdir(parents=True, exist_ok=True)
@@ -291,6 +417,45 @@ def main() -> None:
         return round(value * source_scale)
 
     render_duration = args.duration if args.duration is not None else float(timeline["duration"]) - args.start
+    primary_track = json.loads(
+        project_source(timeline["speaker_track"], args.project_dir).read_text(encoding="utf-8")
+    )
+    validate_speaker_track(
+        primary_track, float(timeline["duration"]), person, source_width
+    )
+    participants = timeline.get("participants", {})
+    participant_tracks = {
+        name: json.loads(
+            project_source(participant["track"], args.project_dir).read_text(encoding="utf-8")
+        )
+        for name, participant in participants.items()
+    }
+    for name, track in participant_tracks.items():
+        validate_speaker_track(
+            track,
+            float(timeline["duration"]),
+            participants[name]["crop"],
+            source_width,
+            visibility=True,
+        )
+    dual_sections = [
+        section
+        for section in timeline.get("layout_sections", [])
+        if section["layout"] == "dual_speaker"
+        and float(section["source_start"]) < args.start + render_duration
+        and float(section["source_end"]) > args.start
+    ]
+    render_window = [(args.start, args.start + render_duration)]
+    render_participants = {}
+    for name, participant in participants.items():
+        sections = [
+            (float(section["source_start"]), float(section["source_end"]))
+            for section in dual_sections
+            if name in {section["left"], section["right"]}
+        ]
+        visible = visible_intervals(participant_tracks[name], float(timeline["duration"]))
+        if intersect_intervals(intersect_intervals(sections, visible), render_window):
+            render_participants[name] = participant
     edits = load_edits(args.edl, args.video, args.project_dir)
     faq_entries = [
         entry
@@ -338,29 +503,134 @@ def main() -> None:
         )
         source = "[private]"
 
-    stage = (
-        privacy
-        + f"{source}split=3[person0][screen0][clock0];"
+    participant_labels = [f"participant-source-{index}" for index in range(len(render_participants))]
+    split_labels = ["person0", "screen0", "clock0", *participant_labels]
+    stage = privacy + f"{source}split={len(split_labels)}" + "".join(
+        f"[{label}]" for label in split_labels
+    ) + ";"
+    stage += (
         f"[person0]sendcmd=f={commands.name},crop@speaker={source_scaled(person['width'])}:{source_scaled(person['height'])}:{initial_x:.2f}:{source_scaled(person['y'])},"
         f"scale={layout_scaled(864)}:{layout_scaled(1536)}:flags=lanczos[person];"
-        f"[screen0]crop={source_scaled(screen['width'])}:{source_scaled(screen['height'])}:{source_scaled(screen['x'])}:{source_scaled(screen['y'])},"
-        f"scale={layout_scaled(2730)}:{layout_scaled(1536)}:flags=lanczos[screen];"
-        f"[1:v]scale={output_width}:{output_height},format=yuv420p[background];"
-        # Keep the camera's frame clock. A looped 30 fps background as the
-        # overlay main duplicates frames when phone timestamps briefly drift.
-        f"[clock0][background]blend=all_expr=B[canvas];"
+        f"[screen0]crop={source_scaled(screen['width'])}:{source_scaled(screen['height'])}:{source_scaled(screen['x'])}:{source_scaled(screen['y'])}[screen-base];"
+    )
+    if dual_sections:
+        stage += (
+            f"[screen-base]split=2[screen-standard0][screen-dual0];"
+            f"[1:v]scale={output_width}:{output_height},format=yuv420p,split=2[background-standard][background-dual];"
+            f"[clock0]split=2[clock-standard][clock-dual];"
+            f"[2:v]split=2[slides-standard0][slides-dual0];"
+        )
+    else:
+        stage += (
+            f"[screen-base]null[screen-standard0];"
+            f"[1:v]scale={output_width}:{output_height},format=yuv420p[background-standard];"
+            f"[clock0]null[clock-standard];"
+            f"[2:v]null[slides-standard0];"
+        )
+    # Keep the camera's frame clock. A looped 30 fps background as the
+    # overlay main duplicates frames when phone timestamps briefly drift.
+    stage += (
+        f"[screen-standard0]scale={layout_scaled(2730)}:{layout_scaled(1536)}:flags=lanczos[screen];"
+        f"[clock-standard][background-standard]blend=all_expr=B[canvas];"
         f"[canvas][person]overlay={layout_scaled(91)}:{layout_scaled(296)}[stage1];"
         f"[stage1][screen]overlay={layout_scaled(1019)}:{layout_scaled(296)}[stage2];"
+        f"[slides-standard0]scale={layout_scaled(2730)}:{layout_scaled(1536)}:flags=lanczos,setpts=PTS+{slide_offset:.6f}/TB[slides-standard];"
+        f"[stage2][slides-standard]overlay={layout_scaled(1019)}:{layout_scaled(296)}:eof_action=pass:enable='gte(t,{slide_enable:.6f})'[standard-out]"
     )
-    slides_filter = (
-        f"[2:v]scale={layout_scaled(2730)}:{layout_scaled(1536)}:flags=lanczos,setpts=PTS+{slide_offset:.6f}/TB[slides];"
-        f"[stage2][slides]overlay={layout_scaled(1019)}:{layout_scaled(296)}:eof_action=pass:enable='gte(t,{slide_enable:.6f})'[outv]"
-    )
-    filter_graph = stage + slides_filter
-    video_label = "outv"
+    filter_graph = stage
+    video_label = "standard-out"
+    if dual_sections:
+        dual_intervals = [
+            (float(section["source_start"]), float(section["source_end"]))
+            for section in dual_sections
+        ]
+        dual_enable = enable_expression(dual_intervals, args.start, render_duration)
+        filter_graph += (
+            f";[screen-dual0]scale={layout_scaled(2400)}:{layout_scaled(1350)}:flags=lanczos[screen-dual]"
+            f";[clock-dual][background-dual]blend=all_expr=B[dual-canvas]"
+            f";[dual-canvas][screen-dual]overlay={layout_scaled(720)}:{layout_scaled(405)}[dual-stage0]"
+            f";[slides-dual0]scale={layout_scaled(2400)}:{layout_scaled(1350)}:flags=lanczos,setpts=PTS+{slide_offset:.6f}/TB[slides-dual]"
+            f";[dual-stage0][slides-dual]overlay={layout_scaled(720)}:{layout_scaled(405)}:eof_action=pass:enable='gte(t,{slide_enable:.6f})'[dual-stage1]"
+        )
+        dual_label = "dual-stage1"
+        for index, (name, participant) in enumerate(render_participants.items()):
+            track = participant_tracks[name]
+            command_file = build / f"participant-{index}.ffcmd"
+            instance = f"participant{index}"
+            initial = make_speaker_commands(
+                project_source(participant["track"], args.project_dir),
+                command_file,
+                args.start,
+                render_duration,
+                source_scale,
+                instance,
+            )
+            crop = participant["crop"]
+            visible = visible_intervals(track, float(timeline["duration"]))
+            left_sections = [
+                (float(section["source_start"]), float(section["source_end"]))
+                for section in dual_sections
+                if section["left"] == name
+            ]
+            right_sections = [
+                (float(section["source_start"]), float(section["source_end"]))
+                for section in dual_sections
+                if section["right"] == name
+            ]
+            filter_graph += (
+                f";[{participant_labels[index]}]sendcmd=f={command_file.name},"
+                f"crop@{instance}={source_scaled(crop['width'])}:{source_scaled(crop['height'])}:{initial:.2f}:{source_scaled(crop['y'])},"
+                f"scale={layout_scaled(640)}:{layout_scaled(1138)}:force_original_aspect_ratio=increase:flags=lanczos,"
+                f"crop={layout_scaled(640)}:{layout_scaled(1138)}[participant-{index}]"
+            )
+            for side, sections, x in (
+                ("left", left_sections, 60),
+                ("right", right_sections, 3140),
+            ):
+                expression = enable_expression(
+                    intersect_intervals(sections, visible), args.start, render_duration
+                )
+                if expression == "0":
+                    continue
+                next_label = f"dual-{side}-{index}"
+                filter_graph += (
+                    f";[{dual_label}][participant-{index}]overlay={layout_scaled(x)}:{layout_scaled(511)}:"
+                    f"eof_action=pass:enable='{expression}'[{next_label}]"
+                )
+                dual_label = next_label
+        for side, x in (("left", 60), ("right", 3140)):
+            active = []
+            for section in dual_sections:
+                if section.get("active") not in {side, "both"}:
+                    continue
+                name = section[side]
+                active.extend(
+                    intersect_intervals(
+                        [(float(section["source_start"]), float(section["source_end"]))],
+                        visible_intervals(
+                            participant_tracks[name], float(timeline["duration"])
+                        ),
+                    )
+                )
+            expression = enable_expression(active, args.start, render_duration)
+            if expression != "0":
+                next_label = f"dual-active-{side}"
+                filter_graph += (
+                    f";[{dual_label}]drawbox=x={layout_scaled(x)}:y={layout_scaled(511)}:"
+                    f"w={layout_scaled(640)}:h={layout_scaled(1138)}:color=#eb0028@0.75:"
+                    f"t={max(2, layout_scaled(8))}:enable='{expression}'[{next_label}]"
+                )
+                dual_label = next_label
+        filter_graph += f";[standard-out][{dual_label}]overlay=0:0:enable='{dual_enable}'[outv]"
+        video_label = "outv"
     audio_label: str | None = None
     audio_source = "0:a:0"
-    if args.audio_policy == "process_once_then_duplicate_to_stereo":
+    if args.audio_policy == "mix_reviewed_microphones_to_stereo":
+        if not timeline.get("mix_mapped_microphones"):
+            raise SystemExit("reviewed microphone mixing is not configured in the timeline")
+        filter_graph += ";" + microphone_mix_filter(timeline, args.start, render_duration)
+        audio_source = "prepareda"
+    elif args.audio_policy == "process_once_then_duplicate_to_stereo":
         filter_graph += ";[0:a:0]pan=mono|c0=c0,pan=stereo|c0=c0|c1=c0[prepareda]"
         audio_source = "prepareda"
     if cuts:
@@ -451,6 +721,20 @@ def main() -> None:
         )
         video_label, audio_label = "finalv", "finala"
 
+    if not audio_label:
+        filter_graph += (
+            f";[0:a:0]atrim=start=0:end={render_duration:.6f},"
+            "asetpts=PTS-STARTPTS[basea]"
+        )
+        audio_label = "basea"
+    filter_graph += (
+        f";[{video_label}]tpad=stop_mode=clone:stop_duration=1,"
+        f"trim=duration={output_duration:.6f},setpts=PTS-STARTPTS[syncv]"
+        f";[{audio_label}]apad,atrim=duration={output_duration:.6f},"
+        "asetpts=PTS-STARTPTS[synca]"
+    )
+    video_label, audio_label = "syncv", "synca"
+
     video_map = f"[{video_label}]"
     audio_map = f"[{audio_label}]" if audio_label else "0:a:0"
 
@@ -500,6 +784,42 @@ def self_test() -> None:
     assert max(abs(target - camera) for target, camera in zip([0] * 4 + [400] * 10, followed)) <= 80
     assert monotone_slopes([0, 1, 2], [0, 1, 0]) == [1.0, 0.0, -1.0]
     assert kept_intervals([(1.0, 2.0)], 3.0) == [(0.0, 1.0), (2.0, 3.0)]
+    assert visible_intervals(
+        [
+            {"time": 0, "visible": True},
+            {"time": 2, "visible": False},
+            {"time": 4, "visible": True},
+            {"time": 6, "visible": True},
+        ],
+        6,
+    ) == [(0.0, 2.0), (4.0, 6.0)]
+    assert enable_expression([(4, 8)], 5, 2) == "between(t,0.000000,2.000000)"
+    assert "(1.000000-0.180000)" in gain_expression(
+        [(0, 1, 0.18), (1, 2, 1.0)], 0.1
+    )
+    mix_filter = microphone_mix_filter(
+        {
+            "participants": {
+                "left": {"audio_channel": 1},
+                "right": {"audio_channel": 2},
+            },
+            "layout_sections": [
+                {
+                    "source_start": 0,
+                    "source_end": 2,
+                    "layout": "dual_speaker",
+                    "left": "left",
+                    "right": "right",
+                    "active": "left",
+                }
+            ],
+            "microphone_mix": {"true_peak_db": -2},
+        },
+        0,
+        2,
+    )
+    assert "async=1:first_pts=0" in mix_filter
+    assert "limit=0.79432823:level=0:latency=1" in mix_filter
     print("render-video self-test: ok")
 
 

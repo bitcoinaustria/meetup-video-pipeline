@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -22,6 +23,7 @@ from video_common import (
     parse_detection_coordinates,
     privacy_detector_command,
     resolve_project_path,
+    validate_speaker_track,
     validate_timeline,
 )
 
@@ -67,38 +69,118 @@ def read_detections(path: Path) -> list[tuple[float, list[Box]]]:
     return rows
 
 
-def privacy_action(speaker: Box | None, others: list[Box], margin: float = 0.035) -> str:
-    if speaker is None:
+def boxes_overlap(left: Box, right: Box, margin: float = 0.035) -> bool:
+    horizontal_gap = max(
+        0.0,
+        max(left.x, right.x) - min(left.x + left.width, right.x + right.width),
+    )
+    vertical_overlap = min(left.y + left.height, right.y + right.height) - max(left.y, right.y)
+    return horizontal_gap <= margin and vertical_overlap > 0.05
+
+
+def privacy_action(
+    speakers: Box | list[Box] | None, others: list[Box], margin: float = 0.035
+) -> str:
+    if isinstance(speakers, Box):
+        speakers = [speakers]
+    if not speakers:
         return "full-blur"
-    for other in others:
-        horizontal_gap = max(0.0, max(speaker.x, other.x) - min(speaker.x + speaker.width, other.x + other.width))
-        vertical_overlap = min(speaker.y + speaker.height, other.y + other.height) - max(speaker.y, other.y)
-        if horizontal_gap <= margin and vertical_overlap > 0.05:
+    for speaker, other in itertools.combinations([*speakers, *others], 2):
+        if boxes_overlap(speaker, other, margin):
             return "full-blur"
     return "blur-others"
 
 
-def problem_windows(path: Path, duration: float, padding: float) -> list[tuple[float, float]]:
+def track_sample(track: list[dict], timestamp: float) -> dict:
+    return next(
+        (item for item in reversed(track) if float(item["time"]) <= timestamp),
+        track[0],
+    )
+
+
+def dual_speakers_and_others(
+    boxes: list[Box],
+    timestamp: float,
+    section: dict,
+    participants: dict,
+    tracks: dict[str, list[dict]],
+    references: dict[str, tuple[float, float]],
+) -> tuple[list[Box] | None, list[Box]]:
+    names = [section["left"], section["right"]]
+    expected = []
+    for name in names:
+        sample = track_sample(tracks[name], timestamp)
+        if not sample["visible"]:
+            continue
+        reviewed_box = sample["box"]
+        expected.append(
+            (
+                name,
+                float(reviewed_box[0]) + float(reviewed_box[2]) / 2,
+                float(reviewed_box[2]),
+                float(reviewed_box[3]),
+            )
+        )
+    if not expected or len(boxes) < len(expected):
+        return None, boxes
+
+    ranked = []
+    for assignment in itertools.permutations(boxes, len(expected)):
+        distances = [
+            abs(box.center - center)
+            + 0.35 * abs(box.width - width)
+            + 0.10 * abs(box.height - height)
+            + 1.50 * abs(box.luma - references[name][0]) / 255
+            + 0.20 * abs(box.contrast - references[name][1]) / 128
+            for box, (name, center, width, height) in zip(assignment, expected)
+        ]
+        ranked.append((sum(distances), max(distances), assignment))
+    ranked.sort(key=lambda item: item[:2])
+    best = ranked[0]
+    ambiguous = len(ranked) > 1 and ranked[1][0] - best[0] < 0.06
+    if best[1] > 0.18 or ambiguous:
+        return None, boxes
+    speakers = list(best[2])
+    return speakers, [box for box in boxes if box not in speakers]
+
+
+def problem_windows(
+    path: Path,
+    duration: float,
+    padding: float,
+    required: list[tuple[float, float]] | None = None,
+) -> list[tuple[float, float]]:
     times = [timestamp for timestamp, boxes in read_detections(path) if len(boxes) > 1]
+    windows = [
+        (max(0, start - padding), min(duration, end + padding))
+        for start, end in (required or [])
+    ]
     groups: list[list[float]] = []
     for timestamp in times:
         if not groups or timestamp - groups[-1][-1] > 1.01:
             groups.append([timestamp])
         else:
             groups[-1].append(timestamp)
-    return [
+    windows.extend(
         (max(0, group[0] - padding), min(duration, group[-1] + 1 + padding))
         for group in groups
-    ]
+    )
+    merged = []
+    for start, end in sorted(windows):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
 
 
 def speaker_and_others(
     detections: list[tuple[float, list[Box]]],
-    reference: tuple[float, float],
+    reference: tuple[float, float] | None,
 ) -> tuple[list[Box | None], list[list[Box]]]:
     singles = [(index, boxes[0]) for index, (_time, boxes) in enumerate(detections) if len(boxes) == 1]
-    if not singles:
-        raise SystemExit("privacy window has no single-person anchor")
+    if not singles or reference is None:
+        return [None] * len(detections), [boxes for _time, boxes in detections]
     first_index, first = singles[0]
     last_index, last = singles[-1]
     reference_luma, reference_contrast = reference
@@ -161,7 +243,7 @@ def add_appearance(frames: list[Path], detections: list[tuple[float, list[Box]]]
                 box.contrast = stats.stddev[0]
 
 
-def speaker_reference(detections: Path, samples: Path) -> tuple[float, float]:
+def speaker_reference(detections: Path, samples: Path) -> tuple[float, float] | None:
     rows = [row for row in read_detections(detections) if len(row[1]) == 1]
     rows = rows[::max(1, len(rows) // 100)]
     pairs = [
@@ -170,13 +252,37 @@ def speaker_reference(detections: Path, samples: Path) -> tuple[float, float]:
         if (samples / f"frame-{round(row[0]) + 1:05d}.jpg").exists()
     ]
     if not pairs:
-        raise SystemExit("privacy review has no usable single-person reference samples")
+        return None
     selected_rows = [row for row, _frame in pairs]
     add_appearance([frame for _row, frame in pairs], selected_rows)
     return (
         median(row[1][0].luma for row in selected_rows),
         median(row[1][0].contrast for row in selected_rows),
     )
+
+
+def participant_references(
+    tracks: dict[str, list[dict]], samples: Path
+) -> dict[str, tuple[float, float]]:
+    references = {}
+    for name, track in tracks.items():
+        rows = [
+            ((float(item["time"]), [Box(*map(float, item["box"]))]),
+             samples / f"frame-{round(float(item['time'])) + 1:05d}.jpg")
+            for item in track
+            if item.get("visible") and item.get("box")
+        ]
+        rows = [(row, frame) for row, frame in rows if frame.exists()]
+        rows = rows[::max(1, len(rows) // 100)]
+        if not rows:
+            raise SystemExit(f"privacy review has no appearance samples for participant {name!r}")
+        detections = [row for row, _frame in rows]
+        add_appearance([frame for _row, frame in rows], detections)
+        references[name] = (
+            median(row[1][0].luma for row in detections),
+            median(row[1][0].contrast for row in detections),
+        )
+    return references
 
 
 def draw_mask(boxes: list[Box], path: Path) -> None:
@@ -207,7 +313,10 @@ def hold_unsafe(unsafe: list[bool]) -> list[bool]:
 
 
 def make_mask(
-    window_dir: Path, duration: float, speakers: list[Box | None], others: list[list[Box]]
+    window_dir: Path,
+    duration: float,
+    speakers: list[list[Box] | None],
+    others: list[list[Box]],
 ) -> tuple[Path, Path]:
     masks = window_dir / "masks"
     cuts = window_dir / "cuts"
@@ -351,10 +460,47 @@ def main() -> None:
     timeline_path = resolve_project_path(project, project.get("timeline", "timeline.json"))
     timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
     validate_timeline(timeline)
-    windows = problem_windows(args.coarse_detections, float(timeline["duration"]), args.padding)
+    dual_sections = [
+        section
+        for section in timeline.get("layout_sections", [])
+        if section["layout"] == "dual_speaker"
+    ]
+    windows = problem_windows(
+        args.coarse_detections,
+        float(timeline["duration"]),
+        args.padding,
+        [
+            (float(section["source_start"]), float(section["source_end"]))
+            for section in dual_sections
+        ],
+    )
     if not windows:
         raise SystemExit("no multi-person privacy windows found")
     reference = speaker_reference(args.coarse_detections, args.samples)
+    participants = timeline.get("participants", {})
+    participant_tracks = {
+        name: json.loads(
+            resolve_project_path(project, participant["track"]).read_text(encoding="utf-8")
+        )
+        for name, participant in participants.items()
+    }
+    dual_names = {
+        section[side]
+        for section in dual_sections
+        for side in ("left", "right")
+    }
+    participant_appearance = participant_references(
+        {name: participant_tracks[name] for name in dual_names}, args.samples
+    )
+    source_width = float(timeline.get("source_width", 3840))
+    for name, track_data in participant_tracks.items():
+        validate_speaker_track(
+            track_data,
+            float(timeline["duration"]),
+            participants[name]["crop"],
+            source_width,
+            visibility=True,
+        )
     build = base / "build/privacy-review"
     build.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
@@ -371,11 +517,42 @@ def main() -> None:
         detections = extract_and_detect(
             args.video, window_dir, start, end - start, detector_command
         )
-        speakers, others = speaker_and_others(detections, reference)
+        primary_speakers, primary_others = speaker_and_others(detections, reference)
+        speakers: list[list[Box] | None] = [
+            [speaker] if speaker is not None else None for speaker in primary_speakers
+        ]
+        others = primary_others
+        for sample_index, (relative_time, boxes) in enumerate(detections):
+            source_time = start + relative_time
+            section = next(
+                (
+                    item
+                    for item in dual_sections
+                    if float(item["source_start"]) <= source_time < float(item["source_end"])
+                ),
+                None,
+            )
+            if section:
+                speakers[sample_index], others[sample_index] = dual_speakers_and_others(
+                    boxes,
+                    source_time,
+                    section,
+                    participants,
+                    participant_tracks,
+                    participant_appearance,
+                )
         mask, cut = make_mask(window_dir, end - start, speakers, others)
         masks.append(mask)
         cuts.append(cut)
-        replacements.append((start, [(time, box) for (time, _boxes), box in zip(detections, speakers, strict=True)]))
+        replacements.append(
+            (
+                start,
+                [
+                    (time, box)
+                    for (time, _boxes), box in zip(detections, primary_speakers, strict=True)
+                ],
+            )
+        )
 
     track = build / "speaker-track.json"
     corrected_track(
