@@ -22,6 +22,7 @@ from video_common import (
     parse_detection_coordinates,
     privacy_detector_command,
     resolve_project_path,
+    validate_timeline,
 )
 
 
@@ -349,6 +350,7 @@ def main() -> None:
 
     timeline_path = resolve_project_path(project, project.get("timeline", "timeline.json"))
     timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
+    validate_timeline(timeline)
     windows = problem_windows(args.coarse_detections, float(timeline["duration"]), args.padding)
     if not windows:
         raise SystemExit("no multi-person privacy windows found")

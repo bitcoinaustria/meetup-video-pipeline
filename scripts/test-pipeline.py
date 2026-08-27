@@ -31,7 +31,9 @@ def make_video(path: Path) -> None:
         "-f", "lavfi", "-i", f"testsrc2=size=1920x1080:rate=30:duration={DURATION}",
         "-f", "lavfi", "-i",
         f"aevalsrc=0.15*sin(2*PI*440*t)|0.15*sin(2*PI*660*t):s=48000:d={DURATION}",
+        "-vf", r"settb=expr=1/90000,setpts=floor(N/2)*6000+mod(N\,2)*900",
         "-shortest", "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        "-fps_mode", "passthrough", "-enc_time_base:v", "demux",
         "-c:a", "aac", "-ac", "2", str(path),
     )
 
@@ -222,6 +224,10 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="meetup-fixture-'", dir=ROOT / "build") as temporary:
         temporary_path = Path(temporary)
         initialized = temporary_path / "initialized/project.json"
+        raw_video = temporary_path / "raw-video.mp4"
+        raw_slides = temporary_path / "raw-slides.pdf"
+        raw_video.write_bytes(b"video")
+        raw_slides.write_bytes(b"slides")
         run(
             sys.executable,
             str(ROOT / "scripts/meetup-video.py"),
@@ -232,9 +238,19 @@ def main() -> None:
             "Example meetup",
             "--event-url",
             "https://example.com/events/meetup",
+            "--video",
+            str(raw_video),
+            "--slides-pdf",
+            str(raw_slides),
         )
         initialized_project = json.loads(initialized.read_text(encoding="utf-8"))
         assert initialized_project["event_url"] == "https://example.com/events/meetup"
+        assert (initialized.parent / initialized_project["video"]).resolve() == raw_video
+        assert (initialized.parent / initialized_project["slides_pdf"]).resolve() == raw_slides
+        for artifact in ("manual-edits.json", "final-edits.json", "faq-timeline.json"):
+            assert json.loads((initialized.parent / artifact).read_text(encoding="utf-8"))["source"] == {
+                "path": initialized_project["video"]
+            }
         assert initialized_project["acceleration"] == "auto" and "encoder" not in initialized_project
         capabilities = subprocess.run(
             [
@@ -268,12 +284,81 @@ def main() -> None:
         )
         assert rejected.returncode and "absolute HTTP(S) URL" in rejected.stderr
         assert not invalid.parent.exists()
+        missing = temporary_path / "missing/project.json"
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/meetup-video.py"),
+                "--project",
+                str(missing),
+                "init",
+                "--name",
+                "Missing source",
+                "--video",
+                str(temporary_path / "does-not-exist.mp4"),
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert rejected.returncode and "does not exist" in rejected.stderr
+        assert not missing.parent.exists()
         project = fixture(temporary_path)
         command = [sys.executable, str(ROOT / "scripts/meetup-video.py"), "--project", str(project)]
         spec = importlib.util.spec_from_file_location("meetup_video", ROOT / "scripts/meetup-video.py")
         assert spec and spec.loader
         meetup_video = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(meetup_video)
+        assert meetup_video.audio_render_policy(
+            {
+                "channel_analysis": {
+                    "classification": "dual_mono",
+                    "render_policy": "process_once_then_duplicate_to_stereo",
+                    "analysis_channels": [1],
+                }
+            }
+        ) == "process_once_then_duplicate_to_stereo"
+        try:
+            meetup_video.audio_render_policy({"channel_analysis": {}})
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("missing audio channel policy must fail closed")
+        dead_lock = temporary_path / "dead.lock"
+        dead_lock.mkdir()
+        atomic_write_json(dead_lock / "owner.json", {"pid": 999_999_999})
+        dead_handle = meetup_video.acquire_render_lock(dead_lock)
+        assert json.loads((dead_lock / "owner.json").read_text(encoding="utf-8"))["pid"] == os.getpid()
+        meetup_video.release_render_lock(dead_lock, dead_handle)
+        contended_lock = temporary_path / "contended.lock"
+        contended_handle = meetup_video.acquire_render_lock(contended_lock)
+        try:
+            meetup_video.acquire_render_lock(contended_lock)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("OS-held render lock must reject a second contender")
+        meetup_video.release_render_lock(contended_lock, contended_handle)
+        for owner in ({"pid": os.getpid()}, None):
+            blocked_lock = temporary_path / f"blocked-{owner is None}.lock"
+            blocked_lock.mkdir()
+            if owner is not None:
+                atomic_write_json(blocked_lock / "owner.json", owner)
+            try:
+                meetup_video.acquire_render_lock(blocked_lock)
+            except SystemExit:
+                pass
+            else:
+                raise AssertionError("live and malformed render locks must fail closed")
+            if owner is not None:
+                (blocked_lock / "owner.json").unlink()
+            blocked_lock.rmdir()
+        assert meetup_video.representative_frame_samples(
+            [index / 30 for index in range(8)]
+        ) == [3 / 30, 4 / 30]
+        guarded = meetup_video.representative_frame_samples(
+            [index / 30 for index in range(46)]
+        )
+        assert min(guarded) >= 0.375 and max(guarded) <= 1.125
         loaded_project = json.loads(project.read_text(encoding="utf-8"))
         loaded_project["_project_dir"] = str(project.parent)
         profile = meetup_video.host_capabilities(loaded_project, refresh=True)
@@ -323,6 +408,16 @@ def main() -> None:
         edl.write_bytes(approved_edl)
         with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
             meetup_video.final_render(loaded_project, project)
+        preflight = json.loads(
+            (project.parent / "build/privacy-preflight.json").read_text(encoding="utf-8")
+        )
+        assert preflight["status"] == "passed" and preflight["clips"]
+        with patch.object(meetup_video, "render", side_effect=AssertionError("cache missed")):
+            meetup_video.privacy_preflight(
+                loaded_project,
+                project,
+                identity={"sha256": preflight["identity_sha256"]},
+            )
         run(*command, "validate", "--resolution", "1920x1080")
         final = project.parent / "output/final/final.mp4"
         level = subprocess.run(
@@ -335,6 +430,21 @@ def main() -> None:
             text=True,
         )
         assert int(level.stdout.strip()) <= 42, level.stdout
+        packet_times = [
+            float(value)
+            for value in subprocess.run(
+                [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(final),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.splitlines()
+            if value
+        ]
+        assert len(packet_times) > 100
+        assert all(right > left for left, right in zip(packet_times, packet_times[1:]))
         make_mask(
             project.parent / "build/privacy/full-blur.mp4",
             "black",

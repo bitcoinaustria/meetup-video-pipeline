@@ -82,6 +82,7 @@ Every command accepts the same manifest through `PROJECT`:
 make check PROJECT=projects/my-talk/project.json
 make capabilities PROJECT=projects/my-talk/project.json
 make privacy-seal PROJECT=projects/my-talk/project.json ANALYZER=codex
+make privacy-preflight PROJECT=projects/my-talk/project.json
 make preview PROJECT=projects/my-talk/project.json START=260 DURATION=60
 make approve PROJECT=projects/my-talk/project.json
 make audio PROJECT=projects/my-talk/project.json ANALYZER=codex

@@ -14,6 +14,7 @@ from video_common import (
     resolve_project_path,
     source_to_output,
     stabilize_camera_positions,
+    validate_timeline,
 )
 
 
@@ -266,10 +267,8 @@ def main() -> None:
         raise SystemExit("render starts before the privacy mask")
 
     timeline = json.loads(args.timeline.read_text(encoding="utf-8"))
+    validate_timeline(timeline)
     slides = timeline["slides"]
-    times = [float(item["time"]) for item in slides]
-    if times != sorted(times) or times[0] != float(timeline["website_until"]):
-        raise SystemExit("timeline must be ordered and start at website_until")
 
     build = args.timeline.resolve().parent / "render"
     build.mkdir(parents=True, exist_ok=True)
@@ -482,7 +481,7 @@ def main() -> None:
         "-map", video_map, "-map", audio_map,
     ))
     command.extend(encoder_options(args.encoder, args.preset))
-    command.extend(("-enc_time_base:v", "1:30"))
+    command.extend(("-enc_time_base:v", "demux"))
     command.extend(("-b:v", bitrate, "-maxrate", maxrate, "-bufsize", bufsize))
     command.extend((
         "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",

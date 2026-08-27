@@ -7,10 +7,17 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
 import numpy as np
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None
+    import msvcrt
 
 from video_common import (
     analysis_range_matches,
@@ -36,6 +43,7 @@ from video_common import (
     source_range_output_duration,
     source_to_output,
     speaker_position,
+    validate_timeline,
 )
 
 
@@ -68,7 +76,13 @@ def load_project(path: Path) -> dict:
     return project
 
 
-def init_project(project_file: Path, name: str, event_url: str = "") -> None:
+def init_project(
+    project_file: Path,
+    name: str,
+    event_url: str = "",
+    video: Path | None = None,
+    slides_pdf: Path | None = None,
+) -> None:
     if project_file.exists():
         raise SystemExit(f"project already exists: {project_file}")
     event_url = event_url.strip()
@@ -76,6 +90,9 @@ def init_project(project_file: Path, name: str, event_url: str = "") -> None:
         parsed = urlparse(event_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise SystemExit("event URL must be an absolute HTTP(S) URL")
+    for label, source in (("video", video), ("slides PDF", slides_pdf)):
+        if source and not source.is_file():
+            raise SystemExit(f"{label} does not exist or is not a file: {source}")
     project_dir = project_file.resolve().parent
     project_dir.mkdir(parents=True, exist_ok=True)
     for directory in ("source", "build", "tmp", "output"):
@@ -91,9 +108,15 @@ def init_project(project_file: Path, name: str, event_url: str = "") -> None:
             "shorts_logo": os.path.relpath(ROOT / "CoverLogo.png", project_dir),
         }
     )
+    if video:
+        project["video"] = os.path.relpath(video.resolve(), project_dir)
+    if slides_pdf:
+        project["slides_pdf"] = os.path.relpath(slides_pdf.resolve(), project_dir)
     atomic_write_json(project_file, project)
     source = {"path": project["video"]}
     atomic_write_json(project_dir / "manual-edits.json", {"version": 1, "source": source, "edits": []})
+    atomic_write_json(project_dir / "final-edits.json", {"version": 1, "source": source, "edits": []})
+    atomic_write_json(project_dir / "faq-timeline.json", {"version": 1, "source": source, "entries": []})
     atomic_write_json(project_dir / "shorts.json", {"version": 1, "clips": []})
     print(project_file)
 
@@ -102,6 +125,19 @@ def project_slug(project: dict, project_file: Path) -> str:
     raw = str(project.get("name", project_file.stem))
     slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", raw).strip("-.")
     return slug or "presentation"
+
+
+def audio_render_policy(audio_edits: dict) -> str:
+    channels = audio_edits.get("channel_analysis", {})
+    classification = channels.get("classification")
+    expected = {
+        "mono": "process_once_then_duplicate_to_stereo",
+        "dual_mono": "process_once_then_duplicate_to_stereo",
+        "independent_channels": "process_and_preserve_each_channel_separately",
+    }.get(classification)
+    if not expected or channels.get("render_policy") != expected or not channels.get("analysis_channels"):
+        raise SystemExit("audio channel classification or render policy is missing or invalid; run audio again")
+    return expected
 
 
 def youtube_time(seconds: float) -> str:
@@ -489,26 +525,60 @@ def representative_frame_samples(times: list[float], maximum: int = 7) -> list[f
             groups[-1].append(timestamp)
     samples = []
     for group in groups:
-        if len(group) <= maximum:
-            samples.extend(group)
+        duration = group[-1] - group[0]
+        transition_guard = min(0.5, max(0.1, duration / 4))
+        stable = [
+            timestamp
+            for timestamp in group
+            if timestamp - group[0] >= transition_guard
+            and group[-1] - timestamp >= transition_guard
+        ]
+        if not stable:
+            stable = [group[len(group) // 2]]
+        if len(stable) <= maximum:
+            samples.extend(stable)
         else:
             samples.extend(
-                group[round(index * (len(group) - 1) / (maximum - 1))]
+                stable[round(index * (len(stable) - 1) / (maximum - 1))]
                 for index in range(maximum)
             )
     return samples
 
 
-def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
-    intervals = full_blur_intervals(project_path(project, "full_blur_mask"))
-    if not intervals:
-        print("privacy artifact check: no full-blur interval to sample")
-        return
+def full_blur_sample_groups(project: dict, intervals: list[list[float]]) -> list[list[float]]:
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
-    track = json.loads(resolve_project_path(project, timeline["speaker_track"]).read_text(encoding="utf-8"))
-    edits, faq = timeline_data(project)
+    edits, _faq = timeline_data(project)
     presentation_start = float(project["presentation_start"])
     _range_start, presentation_end = presentation_bounds(project, float(timeline["duration"]))
+    groups = []
+    for interval in intervals:
+        available = [
+            presentation_start + mask_time
+            for mask_time in interval
+            if not any(
+                float(edit["source_start"])
+                <= presentation_start + mask_time
+                < float(edit["source_end"])
+                for edit in edits
+            )
+            and presentation_start + mask_time < presentation_end
+        ]
+        samples = representative_frame_samples(available)
+        if samples:
+            groups.append(samples)
+    return groups
+
+
+def validate_privacy_samples(
+    path: Path,
+    project: dict,
+    resolution: str,
+    samples: list[tuple[float, float]],
+) -> int:
+    timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
+    track = json.loads(
+        resolve_project_path(project, timeline["speaker_track"]).read_text(encoding="utf-8")
+    )
     output_width, output_height = map(int, resolution.split("x"))
     source_width = float(timeline.get("source_width", 3840))
     if source_width <= 0:
@@ -521,27 +591,10 @@ def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
     conclusive = 0
     passed = 0
     contrasts = []
-    samples = []
-    for interval in intervals:
-        available = [
-            mask_time
-            for mask_time in interval
-            if not any(
-                float(edit["source_start"]) <= presentation_start + mask_time < float(edit["source_end"])
-                for edit in edits
-            )
-            and presentation_start + mask_time < presentation_end
-        ]
-        if available:
-            samples.extend(representative_frame_samples(available))
-    if not samples:
-        print(f"privacy artifact check: all {len(intervals)} full-blur intervals are removed by the EDL")
-        return
     # ponytail: bounded process count; batch FFmpeg validation if real projects exceed this.
     if len(samples) > 720:
         raise SystemExit("privacy mask is too fragmented for bounded artifact validation")
-    for mask_time in samples:
-        source_time = presentation_start + mask_time
+    for source_time, output_time in samples:
         position = speaker_position(track, source_time)
         crop_filter = (
             f"crop={round(crop['width'] * source_scale)}:{round(crop['height'] * source_scale)}:"
@@ -565,7 +618,7 @@ def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
         conclusive += 1
         actual = gray_frame(
             path,
-            source_to_output(source_time, presentation_start, edits, faq),
+            output_time,
             actual_filter,
         )
         actual_energy = high_frequency_energy(actual)
@@ -581,6 +634,30 @@ def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
             f"(maximum edge-energy reduction {max(contrasts, default=0):.3f})"
         )
     print(f"privacy artifact check passed at {passed} full-blur samples")
+    return passed
+
+
+def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
+    intervals = full_blur_intervals(project_path(project, "full_blur_mask"))
+    if not intervals:
+        print("privacy artifact check: no full-blur interval to sample")
+        return
+    groups = full_blur_sample_groups(project, intervals)
+    if not groups:
+        print(f"privacy artifact check: all {len(intervals)} full-blur intervals are removed by the EDL")
+        return
+    edits, faq = timeline_data(project)
+    presentation_start = float(project["presentation_start"])
+    validate_privacy_samples(
+        path,
+        project,
+        resolution,
+        [
+            (source_time, source_to_output(source_time, presentation_start, edits, faq))
+            for group in groups
+            for source_time in group
+        ],
+    )
 
 
 def check(project: dict, project_file: Path, final: bool = False) -> None:
@@ -645,6 +722,7 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
         ):
             raise SystemExit("audio edit artifact is stale for the configured talk range")
         channels = audio_edits.get("channel_analysis", {})
+        audio_render_policy(audio_edits)
         print(
             "audio input: "
             f"{channels.get('classification', 'unknown')} / "
@@ -663,6 +741,7 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
                 raise SystemExit(f"base edit is missing from the final EDL: {base_edit}")
 
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
+    validate_timeline(timeline)
     source_seconds = float(timeline["duration"])
     if abs(source_seconds - media_seconds) > 1 / 30:
         raise SystemExit(
@@ -742,9 +821,7 @@ def render(
     audio_policy = "process_and_preserve_each_channel_separately"
     audio_edits = optional_project_path(project, "audio_edits")
     if audio_edits and audio_edits.exists():
-        audio_policy = json.loads(audio_edits.read_text(encoding="utf-8")).get(
-            "channel_analysis", {}
-        ).get("render_policy", audio_policy)
+        audio_policy = audio_render_policy(json.loads(audio_edits.read_text(encoding="utf-8")))
     else:
         source_audio = next(
             (
@@ -800,6 +877,150 @@ def render(
     return expected
 
 
+def privacy_preflight_path(project: dict) -> Path:
+    return Path(project["_project_dir"]) / "build/privacy-preflight.json"
+
+
+def privacy_preflight(
+    project: dict,
+    project_file: Path,
+    *,
+    force: bool = False,
+    identity: dict | None = None,
+) -> Path:
+    identity = identity or render_identity(project)
+    seal = privacy_preflight_path(project)
+    if not force:
+        try:
+            cached = json.loads(seal.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached = {}
+        if cached.get("status") == "passed" and cached.get("identity_sha256") == identity["sha256"]:
+            print(f"privacy preflight cached: {len(cached.get('clips', []))} clips")
+            return seal
+
+    started = time.monotonic()
+    require_privacy_provenance(project)
+    check(project, project_file)
+    intervals = full_blur_intervals(project_path(project, "full_blur_mask"))
+    groups = full_blur_sample_groups(project, intervals)
+    edits, faq = timeline_data(project)
+    timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
+    presentation_start, presentation_end = presentation_bounds(
+        project, float(timeline["duration"])
+    )
+    output_dir = Path(project["_project_dir"]) / "output/debug/privacy-preflight"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    clips = []
+    for index, samples in enumerate(groups, 1):
+        clip_start = max(presentation_start, samples[0] - 0.75)
+        clip_end = min(presentation_end, samples[-1] + 0.75)
+        output = output_dir / f"full-blur-{index:03d}.mp4"
+        expected = render(
+            project,
+            project_file,
+            clip_start,
+            clip_end - clip_start,
+            output,
+            final=False,
+        )
+        seconds = validate_render(output, "1920x1080", expected)
+        passed = validate_privacy_samples(
+            output,
+            project,
+            "1920x1080",
+            [
+                (source_time, source_to_output(source_time, clip_start, edits, faq))
+                for source_time in samples
+            ],
+        )
+        clips.append(
+            {
+                "path": str(output),
+                "source_start": round(clip_start, 6),
+                "source_end": round(clip_end, 6),
+                "duration": round(seconds, 6),
+                "samples": passed,
+            }
+        )
+    atomic_write_json(
+        seal,
+        {
+            "version": 1,
+            "status": "passed",
+            "identity_sha256": identity["sha256"],
+            "resolution": "1920x1080",
+            "elapsed_seconds": round(time.monotonic() - started, 3),
+            "clips": clips,
+        },
+    )
+    print(f"privacy preflight passed: {len(clips)} clips in {time.monotonic() - started:.1f}s")
+    return seal
+
+
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def acquire_render_lock(lock: Path):
+    guard = Path(f"{lock}.guard")
+    guard.parent.mkdir(parents=True, exist_ok=True)
+    handle = guard.open("a+b")
+    try:
+        if fcntl:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:  # pragma: no cover - Windows fallback
+            if guard.stat().st_size == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    except (BlockingIOError, OSError):
+        handle.close()
+        raise SystemExit(f"final render already active: {lock}") from None
+    try:
+        lock.mkdir()
+    except FileExistsError:
+        try:
+            owner = json.loads((lock / "owner.json").read_text(encoding="utf-8"))
+            pid = int(owner["pid"])
+            if pid <= 0:
+                raise ValueError
+        except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            handle.close()
+            raise SystemExit(f"final render already active or malformed lock exists: {lock}") from None
+        if not owner.get("guarded") and process_is_alive(pid):
+            handle.close()
+            raise SystemExit(f"final render already active under PID {pid}: {lock}")
+        (lock / "owner.json").unlink()
+        lock.rmdir()
+        print(f"recovered stale render lock from PID {pid}: {lock}", file=sys.stderr)
+        lock.mkdir()
+    atomic_write_json(lock / "owner.json", {"pid": os.getpid(), "guarded": True})
+    return handle
+
+
+def release_render_lock(lock: Path, handle) -> None:
+    try:
+        (lock / "owner.json").unlink(missing_ok=True)
+        lock.rmdir()
+    finally:
+        if fcntl:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        else:  # pragma: no cover - Windows fallback
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        handle.close()
+
+
 def final_render(project: dict, project_file: Path) -> None:
     output = project_path(project, "final_output")
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -813,12 +1034,10 @@ def final_render(project: dict, project_file: Path) -> None:
         raise SystemExit("preview approval is missing or stale; render and inspect a new preview")
     if approval.get("approved") is not True:
         raise SystemExit("preview exists but is not explicitly approved")
+    privacy_preflight(project, project_file, identity=identity)
     lock = output.with_suffix(output.suffix + ".lock")
     temporary = output.with_name(f"{output.stem}.rendering{output.suffix}")
-    try:
-        lock.mkdir()
-    except FileExistsError:
-        raise SystemExit(f"final render already active or stale lock exists: {lock}") from None
+    lock_handle = acquire_render_lock(lock)
     try:
         temporary.unlink(missing_ok=True)
         expected = render(
@@ -854,9 +1073,12 @@ def final_render(project: dict, project_file: Path) -> None:
             },
         )
         print(output)
+    except BaseException:
+        if temporary.exists():
+            print(f"retained failed staging render: {temporary}", file=sys.stderr)
+        raise
     finally:
-        temporary.unlink(missing_ok=True)
-        lock.rmdir()
+        release_render_lock(lock, lock_handle)
 
 
 def publishing_copy(project: dict, project_file: Path, analyzer: str | None = None) -> None:
@@ -1023,10 +1245,14 @@ def main() -> None:
     init = subparsers.add_parser("init")
     init.add_argument("--name", required=True)
     init.add_argument("--event-url")
+    init.add_argument("--video", type=Path)
+    init.add_argument("--slides-pdf", type=Path)
     subparsers.add_parser("capabilities")
     subparsers.add_parser("check")
     privacy_seal = subparsers.add_parser("privacy-seal")
     privacy_seal.add_argument("--reviewed-by", required=True)
+    privacy_preflight_parser = subparsers.add_parser("privacy-preflight")
+    privacy_preflight_parser.add_argument("--force", action="store_true")
     preview = subparsers.add_parser("preview")
     preview.add_argument("--start", type=float)
     preview.add_argument("--duration", type=float, default=60.0)
@@ -1044,7 +1270,7 @@ def main() -> None:
     subparsers.add_parser("release")
     args = parser.parse_args()
     if args.command == "init":
-        init_project(args.project, args.name, args.event_url or "")
+        init_project(args.project, args.name, args.event_url or "", args.video, args.slides_pdf)
         return
     project = load_project(args.project)
     project["_resources"] = resource_budget(args.jobs, args.gpu_jobs, args.render_jobs)
@@ -1056,6 +1282,8 @@ def main() -> None:
         check(project, args.project)
     elif args.command == "privacy-seal":
         print(seal_privacy(project, args.reviewed_by))
+    elif args.command == "privacy-preflight":
+        privacy_preflight(project, args.project, force=args.force)
     elif args.command == "preview":
         start = args.start if args.start is not None else float(project["presentation_start"])
         output = (

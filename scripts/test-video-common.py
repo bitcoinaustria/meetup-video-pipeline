@@ -32,6 +32,7 @@ from video_common import (
     source_range_output_duration,
     source_to_output,
     timeline_events_in_range,
+    validate_timeline,
     whisper_tokens,
 )
 
@@ -52,6 +53,22 @@ assert not analysis_range_matches({"range": {"start": 0, "duration": 30}}, 10, 2
 assert timeline_events_in_range(11.5, 1, edits, faq) == ["cut 12.000-13.000"]
 assert timeline_events_in_range(14, 1, edits, faq) == []
 assert build_time_map(3, [{"source_start": 1, "source_end": 2}])["output_duration"] == 2
+valid_timeline = {"duration": 10, "website_until": 1, "slides": [{"time": 1}, {"time": 5}]}
+validate_timeline(valid_timeline)
+for invalid_timeline in (
+    {**valid_timeline, "slides": [{"time": 5}, {"time": 1}]},
+    {**valid_timeline, "slides": [{"time": 1}, {"time": 1}]},
+    {**valid_timeline, "website_until": 2},
+    {**valid_timeline, "slides": [{"time": 1}, {"time": 10}]},
+    {**valid_timeline, "slides": [{"time": 1}, {"time": 11}]},
+    {**valid_timeline, "slides": [{"time": float("nan")}]},
+):
+    try:
+        validate_timeline(invalid_timeline)
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("invalid timeline must fail before rendering")
 assert configured_analyzer({"analyzer": "codex"}, "audio") == "codex"
 assert encoder_candidates("Darwin") == ["h264_videotoolbox"]
 assert encoder_candidates("Linux")[0] == "h264_nvenc"
@@ -243,6 +260,20 @@ with tempfile.TemporaryDirectory() as directory:
                 assert message in str(error)
             else:
                 raise AssertionError(message)
+    if platform.system() == "Darwin":
+        capability_project["encoder"] = "auto"
+        with (
+            patch("video_common.shutil.which", return_value=sys.executable),
+            patch("video_common._ffmpeg_version", return_value="ffmpeg test"),
+            patch(
+                "video_common._encoder_works",
+                side_effect=[(False, "temporarily busy"), (True, "")],
+            ) as encoder_probe,
+            patch("video_common.time.sleep"),
+        ):
+            recovered = host_capabilities(capability_project, refresh=True)
+        assert recovered["video_encoder"]["name"] == "h264_videotoolbox"
+        assert encoder_probe.call_count == 2
     trust_patch.stop()
 
     source = Path(directory) / "source"

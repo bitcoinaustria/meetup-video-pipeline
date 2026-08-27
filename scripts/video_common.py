@@ -4,12 +4,14 @@ import bisect
 import functools
 import hashlib
 import json
+import math
 import os
 import platform
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -372,6 +374,14 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
     selected = None
     for encoder in candidates:
         works, detail = _encoder_works(ffmpeg, encoder, resolution)
+        if not works and encoder in hardware_encoders:
+            first_detail = detail
+            time.sleep(0.5)
+            works, detail = _encoder_works(ffmpeg, encoder, resolution)
+            if works:
+                detail = f"recovered after retry: {first_detail}"
+            else:
+                detail = f"{first_detail}; retry: {detail}"
         probes.append({"encoder": encoder, "available": works, "detail": detail})
         if works:
             selected = encoder
@@ -533,6 +543,29 @@ def presentation_bounds(project: dict, source_duration: float) -> tuple[float, f
             f"invalid presentation range {start:.3f}-{end:.3f} for {source_duration:.3f}s source"
         )
     return start, min(end, source_duration)
+
+
+def validate_timeline(timeline: dict) -> None:
+    try:
+        duration = float(timeline["duration"])
+        website_until = float(timeline["website_until"])
+        times = [float(item["time"]) for item in timeline["slides"]]
+    except (KeyError, TypeError, ValueError) as error:
+        raise SystemExit("timeline is missing numeric duration, website_until, or slide times") from error
+    if (
+        not math.isfinite(duration)
+        or not math.isfinite(website_until)
+        or any(not math.isfinite(time_value) for time_value in times)
+        or duration <= 0
+        or not times
+    ):
+        raise SystemExit("timeline duration and slides must be non-empty")
+    if any(right <= left for left, right in zip(times, times[1:])):
+        raise SystemExit("timeline slide times must be strictly increasing")
+    if abs(times[0] - website_until) > 1e-6:
+        raise SystemExit("timeline must start at website_until")
+    if website_until < 0 or any(time_value < 0 or time_value >= duration for time_value in times):
+        raise SystemExit("timeline events must stay inside its duration")
 
 
 def analysis_range_matches(source: dict, start: float, end: float) -> bool:
