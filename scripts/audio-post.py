@@ -26,7 +26,6 @@ from video_common import (
     encoder_options,
     event_context,
     ffconcat_quote,
-    host_capabilities,
     file_sha256 as sha256_file,
     optional_project_path,
     read_prompt_source,
@@ -336,6 +335,8 @@ def transcribe_chunks(
     threads: int,
     refresh: bool,
     project_dir: Path,
+    source_sha256: str,
+    repetition_reviews: list[dict],
 ) -> tuple[list[dict], list[dict]]:
     with wave.open(str(wav_path), "rb") as audio:
         duration = audio.getnframes() / audio.getframerate()
@@ -346,17 +347,68 @@ def transcribe_chunks(
         chunk_wav = output_dir / f"channel-{channel}-chunk-{index:02d}.wav"
         prefix = output_dir / f"channel-{channel}-{model.stem}-chunk-{index:02d}"
         transcript = prefix.with_suffix(".json")
+        raw_prefix = prefix.with_name(f"{prefix.name}-raw")
+        raw_transcript = raw_prefix.with_suffix(".json")
         if refresh or not chunk_wav.exists():
             extract_audio_clip(wav_path, chunk_start, chunk_duration, chunk_wav)
-        if refresh or not transcript.exists():
-            transcript = transcribe(chunk_wav, prefix, whisper, model, language, threads)
+        if refresh or not raw_transcript.exists():
+            existing = (
+                json.loads(transcript.read_text(encoding="utf-8"))
+                if transcript.exists()
+                else None
+            )
+            if not refresh and existing and not existing.get("pipeline_warnings"):
+                shutil.copy2(transcript, raw_transcript)
+            else:
+                raw_transcript = transcribe(
+                    chunk_wav, raw_prefix, whisper, model, language, threads
+                )
         chunk_offset = source_offset + chunk_start
+        transcript_data = json.loads(raw_transcript.read_text(encoding="utf-8"))
+        repeated = repeated_transcript_phrase(
+            " ".join(str(item.get("text", "")) for item in transcript_data.get("transcription", []))
+        )
+        if repeated:
+            sanitized, removed = trim_repeated_transcript_segments(transcript_data)
+            if not removed or not all(
+                repetition_reviewed(
+                    repetition_reviews,
+                    source_sha256,
+                    channel,
+                    chunk_offset,
+                    item,
+                )
+                for item in removed
+            ):
+                transcript.unlink(missing_ok=True)
+                raise SystemExit(
+                    f"Whisper transcript repeats {repeated!r} at least four times in {transcript}; "
+                    "inspect it against the audio and record an audio_repetition_reviews decision"
+                )
+            remaining = repeated_transcript_phrase(
+                " ".join(str(item.get("text", "")) for item in sanitized.get("transcription", []))
+            )
+            if remaining:
+                raise SystemExit(f"reviewed transcript still contains repeated phrase {remaining!r}: {transcript}")
+            sanitized.setdefault("pipeline_warnings", []).append(
+                {"type": "repeated_transcript_segments_removed", "groups": removed}
+            )
+            atomic_write_json(transcript, sanitized)
+            print(
+                f"removed {sum(item['removed_segments'] for item in removed)} repeated Whisper "
+                f"segments from reviewed transcript {transcript}; source audio remains unchanged",
+                file=sys.stderr,
+            )
+        elif not transcript.exists() or json.loads(transcript.read_text(encoding="utf-8")) != transcript_data:
+            atomic_write_json(transcript, transcript_data)
         words.extend(transcript_words(transcript, channel, chunk_offset))
         files.append(
             {
                 "channel": channel,
+                "role": "primary",
                 "path": manifest_path(transcript, project_dir),
                 "source_offset": chunk_offset,
+                "duration": chunk_duration,
                 "sha256": file_sha256(transcript),
             }
         )
@@ -365,6 +417,75 @@ def transcribe_chunks(
 
 def text_tokens(text: str) -> list[str]:
     return [normalize_word(token) for token in re.findall(r"[\wäöüÄÖÜß]+", text) if normalize_word(token)]
+
+
+def repeated_transcript_phrase(text: str, repeats: int = 4) -> str | None:
+    tokens = text_tokens(text)
+    for width in range(3, min(24, len(tokens) // repeats) + 1):
+        for start in range(len(tokens) - width * repeats + 1):
+            phrase = tokens[start:start + width]
+            if all(
+                tokens[start + repeat * width:start + (repeat + 1) * width] == phrase
+                for repeat in range(1, repeats)
+            ):
+                return " ".join(phrase)
+    return None
+
+
+def trim_repeated_transcript_segments(data: dict, repeats: int = 4) -> tuple[dict, list[dict]]:
+    segments = data.get("transcription", [])
+    kept = []
+    removed = []
+    index = 0
+    while index < len(segments):
+        tokens = text_tokens(str(segments[index].get("text", "")))
+        end = index + 1
+        while end < len(segments) and text_tokens(str(segments[end].get("text", ""))) == tokens:
+            end += 1
+        if len(tokens) >= 3 and end - index >= repeats:
+            kept.append(segments[index])
+            first_offsets = segments[index].get("offsets", {})
+            last_offsets = segments[end - 1].get("offsets", {})
+            removed.append(
+                {
+                    "phrase": " ".join(tokens),
+                    "occurrences": end - index,
+                    "removed_segments": end - index - 1,
+                    "from_ms": first_offsets.get("from"),
+                    "to_ms": last_offsets.get("to"),
+                }
+            )
+        else:
+            kept.extend(segments[index:end])
+        index = end
+    return ({**data, "transcription": kept} if removed else data), removed
+
+
+def repetition_reviewed(
+    reviews: list[dict],
+    source_sha256: str,
+    channel: int,
+    source_offset: float,
+    group: dict,
+) -> bool:
+    for review in reviews:
+        try:
+            matches = (
+                review.get("action") == "keep_first"
+                and review.get("source_sha256") == source_sha256
+                and int(review.get("channel", 0)) == channel
+                and abs(float(review.get("source_offset", -1)) - source_offset) <= 0.05
+                and " ".join(text_tokens(str(review.get("phrase", "")))) == group["phrase"]
+                and int(review.get("occurrences", -1)) == group["occurrences"]
+                and int(review.get("from_ms", -1)) == group["from_ms"]
+                and int(review.get("to_ms", -1)) == group["to_ms"]
+                and bool(str(review.get("reviewed_by", "")).strip())
+            )
+        except (TypeError, ValueError):
+            matches = False
+        if matches:
+            return True
+    return False
 
 
 def secondary_disfluency_hints(primary_words: list[dict], secondary_text: str) -> list[dict]:
@@ -521,6 +642,7 @@ def transcribe_secondary_chunks(
             hint.update({"channel": channel, "source_offset": global_offset, "window": window_index})
         artifact = {
             "channel": channel,
+            "role": "secondary",
             "path": manifest_path(cache, Path(project["_project_dir"])),
             "source_offset": global_offset,
             "duration": round(window_duration, 3),
@@ -530,16 +652,17 @@ def transcribe_secondary_chunks(
 
     all_hints = []
     artifacts = []
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(workers, len(jobs) or 1)) as executor:
-            results = list(executor.map(transcribe_window, jobs))
-    except SystemExit:
-        raise
-    for hints, artifact in results:
-        if artifact.get("status") == "failed_closed":
-            return [], artifacts, artifact
-        all_hints.extend(hints)
-        artifacts.append(artifact)
+    batches = ([[jobs[0]]] if jobs else []) + [
+        jobs[index:index + workers] for index in range(1, len(jobs), workers)
+    ]
+    for batch in batches:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(batch)) as executor:
+            results = list(executor.map(transcribe_window, batch))
+        for hints, artifact in results:
+            if artifact.get("status") == "failed_closed":
+                return [], artifacts, artifact
+            all_hints.extend(hints)
+            artifacts.append(artifact)
     artifacts.sort(key=lambda item: (item["channel"], item["source_offset"]))
     return all_hints, artifacts, {
         "status": "passed",
@@ -1703,7 +1826,7 @@ def analyze(args: argparse.Namespace) -> None:
         raise SystemExit("threads, jobs, and gpu-jobs must be positive")
     project = json.loads(args.project.read_text(encoding="utf-8"))
     project["_project_dir"] = str(args.project.resolve().parent)
-    encoder = host_capabilities(project)["video_encoder"]["name"]
+    encoder = "libx264"
     args.video = args.video or project_path(project, "video")
     args.timeline = args.timeline or project_path(project, "timeline")
     args.output = args.output or Path(project["_project_dir"]) / "build/audio-post"
@@ -1771,6 +1894,8 @@ def analyze(args: argparse.Namespace) -> None:
             args.threads,
             analysis_changed,
             Path(project["_project_dir"]),
+            identity["sha256"],
+            project.get("audio_repetition_reviews", []),
         )
         transcript_files.extend(channel_transcripts)
         words_by_channel[channel] = channel_words
@@ -1888,6 +2013,8 @@ def analyze(args: argparse.Namespace) -> None:
         "version": 1,
         "policy": SEMANTIC_POLICY,
         "source": identity,
+        "channel_analysis": channel_analysis,
+        "transcripts": transcript_files,
         "edits": approved,
         "summary": {
             "approved": len(approved),
@@ -1915,8 +2042,77 @@ def analyze(args: argparse.Namespace) -> None:
 def self_test() -> None:
     from unittest.mock import patch
 
+    assert repeated_transcript_phrase("eins zwei drei " * 2) is None
+    assert repeated_transcript_phrase("eins zwei drei " * 4) == "eins zwei drei"
+    repeated_segments = {
+        "transcription": [
+            {"text": "eins zwei drei", "offsets": {"from": index * 1000, "to": (index + 1) * 1000}}
+            for index in range(4)
+        ]
+    }
+    sanitized, removed = trim_repeated_transcript_segments(repeated_segments)
+    assert removed[0]["removed_segments"] == 3 and len(sanitized["transcription"]) == 1
+    assert len(repeated_segments["transcription"]) == 4
+    review = {
+        "source_sha256": "source",
+        "channel": 1,
+        "source_offset": 10.0,
+        "phrase": "eins zwei drei",
+        "occurrences": 4,
+        "from_ms": 0,
+        "to_ms": 4000,
+        "action": "keep_first",
+        "reviewed_by": "test",
+    }
+    assert repetition_reviewed([review], "source", 1, 10.0, removed[0])
+    assert not repetition_reviewed([review], "other", 1, 10.0, removed[0])
     with patch("shutil.which", return_value=None), patch.object(Path, "exists", return_value=True):
         assert resolve_secondary_cli({}) == DEFAULT_TYPEWHISPER
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "channel.wav"
+        with wave.open(str(source), "wb") as audio:
+            audio.setnchannels(1)
+            audio.setsampwidth(2)
+            audio.setframerate(1)
+            audio.writeframes(b"\0\0" * 70)
+        shutil.copy2(source, Path(directory) / "channel-1-chunk-01.wav")
+        raw = Path(directory) / "channel-1-model-chunk-01-raw.json"
+        atomic_write_json(raw, repeated_segments)
+        derived = Path(directory) / "channel-1-model-chunk-01.json"
+        atomic_write_json(derived, {"transcription": sanitized["transcription"], "pipeline_warnings": [{}]})
+        try:
+            transcribe_chunks(
+                source, Path(directory), 1, 10.0, Path("unused"), Path("model"),
+                "de", 1, False, Path(directory), "source", [],
+            )
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("cached sanitization must require its current review")
+        assert raw.exists() and not derived.exists()
+        transcribe_chunks(
+            source, Path(directory), 1, 10.0, Path("unused"), Path("model"),
+            "de", 1, False, Path(directory), "source", [review],
+        )
+        assert len(json.loads(raw.read_text(encoding="utf-8"))["transcription"]) == 4
+        assert len(json.loads(derived.read_text(encoding="utf-8"))["transcription"]) == 1
+        project = {
+            "_project_dir": directory,
+            "audio_secondary_transcriber": {"enabled": True, "required": False},
+        }
+        with (
+            patch.object(sys.modules[__name__], "resolve_secondary_cli", return_value=Path(sys.executable)),
+            patch.object(sys.modules[__name__], "extract_audio_clip"),
+            patch.object(
+                sys.modules[__name__],
+                "run",
+                side_effect=subprocess.TimeoutExpired("typewhisper", 1),
+            ) as secondary_run,
+        ):
+            _hints, _artifacts, status = transcribe_secondary_chunks(
+                project, {1: source}, {1: []}, Path(directory), "de", 0.0, 1
+            )
+        assert status["status"] == "failed_closed" and secondary_run.call_count == 1
     words = {
         1: [
             {"text": "Wir", "normalized": "wir", "start": 0.0, "end": 0.3, "probability": 0.99, "channel": 1},

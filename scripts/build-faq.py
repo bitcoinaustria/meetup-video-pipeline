@@ -216,8 +216,10 @@ def ensure_transcript(
     *,
     external: bool,
 ) -> tuple[Path, float]:
-    if external and path.exists():
-        return path, configured_start
+    if external:
+        if path.exists():
+            return path, configured_start
+        raise SystemExit(f"configured FAQ transcript is missing: {path}")
     identity = {
         **content_fingerprint(wav, path.with_suffix(".audio-content.json")),
         "source_start": source_start,
@@ -383,6 +385,60 @@ def faq_analysis_channels(project: dict, wav: Path) -> list[int]:
     raise SystemExit(
         "stereo FAQ analysis requires current audio_edits channel classification; run audio first"
     )
+
+
+def audio_transcript_records(
+    project: dict,
+    video: Path,
+    channels: list[int],
+    presentation_start: float,
+    presentation_end: float,
+) -> dict[int, list[tuple[Path, float]]]:
+    message = "audio transcript cache is missing or stale; run audio again"
+    audio_edits = resolve_project_path(project, str(project.get("audio_edits", "")))
+    try:
+        data = json.loads(audio_edits.read_text(encoding="utf-8"))
+        source = data["source"]
+        source_path = resolve_project_path(project, str(source["path"]))
+        fingerprint = content_fingerprint(
+            video, Path(project["_project_dir"]) / "build/source-fingerprint.json"
+        )
+        if (
+            source_path.resolve() != video.resolve()
+            or int(source.get("size", -1)) != fingerprint["size"]
+            or source.get("sha256") != fingerprint["sha256"]
+            or not analysis_range_matches(source, presentation_start, presentation_end)
+        ):
+            raise ValueError
+        records = {channel: [] for channel in channels}
+        for record in data.get("transcripts", []):
+            role = record.get("role", "secondary" if "duration" in record else "primary")
+            channel = int(record.get("channel", 0))
+            if role != "primary" or channel not in records:
+                continue
+            path = resolve_project_path(project, str(record["path"]))
+            if not path.is_file() or file_sha256(path) != record.get("sha256"):
+                raise ValueError
+            duration = float(record["duration"])
+            if not math.isfinite(duration) or duration <= 0:
+                raise ValueError
+            records[channel].append((path, float(record["source_offset"]), duration))
+        if any(not records[channel] for channel in channels):
+            raise ValueError
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as error:
+        raise SystemExit(message) from error
+    validated = {}
+    for channel, items in records.items():
+        cursor = presentation_start
+        ordered = sorted(items, key=lambda item: item[1])
+        for _path, offset, duration in ordered:
+            if not math.isfinite(offset) or abs(offset - cursor) > 0.05:
+                raise SystemExit(message)
+            cursor = offset + duration
+        if abs(cursor - presentation_end) > 0.05:
+            raise SystemExit(message)
+        validated[channel] = [(path, offset) for path, offset, _duration in ordered]
+    return validated
 
 
 def analysis_schema() -> dict:
@@ -875,6 +931,9 @@ def main() -> None:
                 "independent-channel FAQ transcripts require faq_transcript_channel"
             )
         channels = [transcript_channel]
+    cached_transcripts = None if external_transcript else audio_transcript_records(
+        project, video, channels, presentation_start, presentation_end
+    )
     prompt = str(
         project.get(
             "transcription_prompt",
@@ -893,24 +952,32 @@ def main() -> None:
     segments = []
     transcript_records = []
     for channel in channels:
-        transcript_path = (
-            resolve_project_path(project, project["faq_transcript"])
-            if external_transcript
-            else work / f"{project.get('name', 'presentation')}-channel-{channel}-transcript.json"
-        )
-        transcription_wav = (
-            wav if external_transcript else prepare_transcription_audio(wav, work, channel)
-        )
-        transcript, transcript_start = ensure_transcript(
-            transcript_path,
-            transcription_wav,
-            scan_start,
-            float(project.get("faq_transcript_start", scan_start)),
-            str(project.get("language", "de")),
-            prompt,
-            external=external_transcript,
-        )
-        channel_segments = load_segments(transcript, transcript_start, scan_start, scan_end)
+        if external_transcript:
+            transcript = resolve_project_path(project, project["faq_transcript"])
+            transcript, transcript_start = ensure_transcript(
+                transcript,
+                wav,
+                scan_start,
+                float(project.get("faq_transcript_start", scan_start)),
+                str(project.get("language", "de")),
+                prompt,
+                external=True,
+            )
+            channel_transcripts = [(transcript, transcript_start)]
+        else:
+            channel_transcripts = cached_transcripts[channel]
+        channel_segments = []
+        for transcript, transcript_start in channel_transcripts:
+            channel_segments.extend(load_segments(transcript, transcript_start, scan_start, scan_end))
+            transcript_records.append(
+                {
+                    "channel": channel,
+                    "sha256": file_sha256(transcript),
+                    "source_start": transcript_start,
+                }
+            )
+        for index, segment in enumerate(channel_segments, 1):
+            segment["id"] = index
         for segment in channel_segments:
             segment["channel"] = channel
         quiet_threshold = annotate_levels(wav, channel_segments, channel)
@@ -918,13 +985,6 @@ def main() -> None:
         for segment in channel_segments:
             segment["candidate"] = segment["id"] in local_candidates
         segments.extend(channel_segments)
-        transcript_records.append(
-            {
-                "channel": channel,
-                "sha256": file_sha256(transcript),
-                "source_start": transcript_start,
-            }
-        )
     segments.sort(key=lambda item: (item["source_start"], item["channel"], item["source_end"]))
     for index, segment in enumerate(segments, 1):
         segment["id"] = index
@@ -1015,6 +1075,74 @@ def self_test() -> None:
         )
         project = {"_project_dir": directory, "audio_edits": "audio-edits.json"}
         assert faq_analysis_channels(project, stereo) == [1, 2]
+        video = root / "video.mp4"
+        video.write_bytes(b"video")
+        first_transcript = root / "chunk-01.json"
+        second_transcript = root / "chunk-02.json"
+        first_transcript.write_text(
+            '{"transcription":[{"offsets":{"from":0,"to":1000},"text":"Das ist eine Aussage."}]}',
+            encoding="utf-8",
+        )
+        second_transcript.write_text(
+            '{"transcription":[{"offsets":{"from":0,"to":1000},"text":"Wie funktioniert das?"}]}',
+            encoding="utf-8",
+        )
+        atomic_write_json(
+            root / "audio-edits.json",
+            {
+                "source": {
+                    "path": "video.mp4",
+                    "size": video.stat().st_size,
+                    "sha256": file_sha256(video),
+                    "range": {"start": 10.0, "duration": 20.0},
+                },
+                "channel_analysis": {"analysis_channels": [1]},
+                "transcripts": [
+                    {
+                        "channel": 1,
+                        "role": "primary",
+                        "path": "chunk-01.json",
+                        "source_offset": 10.0,
+                        "duration": 10.0,
+                        "sha256": file_sha256(first_transcript),
+                    },
+                    {
+                        "channel": 1,
+                        "role": "primary",
+                        "path": "chunk-02.json",
+                        "source_offset": 20.0,
+                        "duration": 10.0,
+                        "sha256": file_sha256(second_transcript),
+                    },
+                ],
+            },
+        )
+        records = audio_transcript_records(project, video, [1], 10.0, 30.0)
+        assert records == {1: [(first_transcript, 10.0), (second_transcript, 20.0)]}
+        chunk_segments = []
+        for path, offset in records[1]:
+            chunk_segments.extend(load_segments(path, offset, 10.0, 30.0))
+        for index, segment in enumerate(chunk_segments, 1):
+            segment.update({"id": index, "level_dbfs": 0.0})
+        selected = set(candidate_ids(chunk_segments, -60.0))
+        assert [segment["text"] for segment in chunk_segments if segment["id"] in selected] == [
+            "Wie funktioniert das?"
+        ]
+        incomplete = json.loads((root / "audio-edits.json").read_text(encoding="utf-8"))
+        incomplete["transcripts"].pop()
+        atomic_write_json(root / "audio-edits.json", incomplete)
+        try:
+            audio_transcript_records(project, video, [1], 10.0, 30.0)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("incomplete audio transcript coverage must fail closed")
+        try:
+            ensure_transcript(root / "missing.json", stereo, 10, 10, "de", "", external=True)
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("missing configured FAQ transcript must fail closed")
         first = [{"local_start": 0.0, "local_end": 1.0}]
         second = [{"local_start": 0.0, "local_end": 1.0}]
         annotate_levels(stereo, first, 1)
