@@ -423,6 +423,11 @@ def main() -> None:
         assert min(guarded) >= 0.375 and max(guarded) <= 1.125
         loaded_project = json.loads(project.read_text(encoding="utf-8"))
         loaded_project["_project_dir"] = str(project.parent)
+        transition_samples = meetup_video.full_blur_sample_groups(
+            loaded_project,
+            [[1.8, 1.9, 1.967, 2.0, 2.033, 2.1, 2.2]],
+        )
+        assert all(abs(sample - 2.0) >= 0.1 for group in transition_samples for sample in group)
         profile = meetup_video.host_capabilities(loaded_project, refresh=True)
         assert not profile["privacy_detector"]["qualified"]
         test_profile = json.loads(json.dumps(profile))

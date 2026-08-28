@@ -566,6 +566,10 @@ def full_blur_sample_groups(project: dict, intervals: list[list[float]]) -> list
     edits, _faq = timeline_data(project)
     presentation_start = float(project["presentation_start"])
     _range_start, presentation_end = presentation_bounds(project, float(timeline["duration"]))
+    layout_transitions = {
+        float(section["source_start"])
+        for section in timeline.get("layout_sections", [])[1:]
+    }
     groups = []
     for interval in intervals:
         available = [
@@ -578,6 +582,10 @@ def full_blur_sample_groups(project: dict, intervals: list[list[float]]) -> list
                 for edit in edits
             )
             and presentation_start + mask_time < presentation_end
+            and all(
+                abs(presentation_start + mask_time - transition) >= 0.1
+                for transition in layout_transitions
+            )
         ]
         samples = representative_frame_samples(available)
         if samples:
