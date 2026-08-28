@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw, ImageStat
 from video_common import (
     atomic_write_json,
     atomic_write_text,
+    decoder_options,
     ffconcat_quote,
     host_capabilities,
     parse_detection_coordinates,
@@ -363,7 +364,8 @@ def extract_and_detect(
     frames = window_dir / "frames"
     frames.mkdir(parents=True)
     run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", str(video),
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *decoder_options(),
+        "-ss", f"{start:.3f}", "-i", str(video),
         "-t", f"{duration:.3f}", "-vf", f"fps={DETECT_FPS},scale={MASK_SIZE[0]}:{MASK_SIZE[1]}",
         "-q:v", "3", str(frames / "frame-%05d.jpg"),
     ])

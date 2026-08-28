@@ -13,6 +13,7 @@ from video_common import (
     atomic_write_json,
     atomic_write_text,
     content_fingerprint,
+    decoder_options,
     encoder_options,
     ffconcat_quote,
     file_sha256,
@@ -297,7 +298,7 @@ def render_clip(
     encoding = encoder_options(encoder, "ultrafast")
     encoding.extend(("-crf", "18") if encoder == "libx264" else ("-b:v", "20M"))
     run([
-        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", *decoder_options(),
         "-ss", f"{source_start:.3f}", "-i", str(raw_video),
         "-ss", f"{mask_offset:.3f}", "-i", str(privacy_mask),
         "-ss", f"{mask_offset:.3f}", "-i", str(full_blur_mask),

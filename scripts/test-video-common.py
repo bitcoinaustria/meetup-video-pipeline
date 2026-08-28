@@ -18,6 +18,7 @@ from video_common import (
     detector_command_sha256,
     configured_analyzer,
     content_fingerprint,
+    decoder_options,
     encoder_candidates,
     encoder_options,
     event_context,
@@ -154,6 +155,8 @@ for invalid_timeline in (
         raise AssertionError("invalid timeline must fail before rendering")
 assert configured_analyzer({"analyzer": "codex"}, "audio") == "codex"
 assert encoder_candidates("Darwin") == ["h264_videotoolbox"]
+assert decoder_options("Darwin") == ["-hwaccel", "videotoolbox"]
+assert decoder_options("Linux") == []
 assert encoder_candidates("Linux")[0] == "h264_nvenc"
 assert encoder_options("h264_nvenc", "ultrafast") == ["-c:v", "h264_nvenc"]
 assert encoder_options("libx264", "slow") == ["-c:v", "libx264", "-preset", "slow"]

@@ -59,6 +59,10 @@ def encoder_options(encoder: str, preset: str | None = None) -> list[str]:
     return options
 
 
+def decoder_options(system: str | None = None) -> list[str]:
+    return ["-hwaccel", "videotoolbox"] if (system or platform.system()) == "Darwin" else []
+
+
 def _ffmpeg_version(ffmpeg: str) -> str:
     result = subprocess.run(
         [ffmpeg, "-version"], check=True, capture_output=True, text=True, timeout=10

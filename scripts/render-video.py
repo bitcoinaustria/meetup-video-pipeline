@@ -9,6 +9,7 @@ from pathlib import Path
 
 from video_common import (
     atomic_write_text,
+    decoder_options,
     encoder_options,
     ffconcat_quote,
     monotone_slopes,
@@ -741,7 +742,7 @@ def main() -> None:
     bitrate, maxrate, bufsize = ("8M", "12M", "16M") if output_width == 1920 else ("24M", "32M", "48M")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y"]
+    command = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", *decoder_options()]
     if args.start:
         command.extend(("-ss", f"{args.start:.6f}"))
     command.extend((
