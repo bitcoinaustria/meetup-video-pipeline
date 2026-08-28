@@ -10,6 +10,13 @@ from video_common import atomic_write_json, atomic_write_text
 SMOOTH_WEIGHTS = (1, 4, 6, 4, 1)
 
 
+def clipped_box(box: list[float]) -> list[float]:
+    x, y, width, height = box
+    left, top = min(1.0, max(0.0, x)), min(1.0, max(0.0, y))
+    right, bottom = min(1.0, max(0.0, x + width)), min(1.0, max(0.0, y + height))
+    return [left, top, right - left, bottom - top]
+
+
 def smooth_positions(values: list[float]) -> list[float]:
     radius = len(SMOOTH_WEIGHTS) // 2
     divisor = sum(SMOOTH_WEIGHTS)
@@ -111,8 +118,8 @@ def build(
         for item in encoded.split(";"):
             if not item:
                 continue
-            x, _y, width, height = map(float, item.split(","))
-            if height >= 0.12:
+            x, _y, width, height = clipped_box(list(map(float, item.split(","))))
+            if width > 0 and height >= 0.12:
                 boxes.append(
                     (x + width / 2, width, height / max(width, 0.01), [x, _y, width, height])
                 )
@@ -201,6 +208,10 @@ def main() -> None:
 
     args = parser.parse_args()
     if args.command == "self-test":
+        assert [round(value, 2) for value in clipped_box([0.94, -0.01, 0.07, 0.5])] == [
+            0.94, 0.0, 0.06, 0.49
+        ]
+        assert clipped_box([1.1, 0.0, 0.2, 0.5])[2] == 0
         assert smooth_positions([10.0] * 9) == [10.0] * 9
         assert stable_visibility([0, 0.5, 1.0], [True, False, True], 1.1, 0.0) == [True] * 3
         assert stable_visibility([0, 0.5, 1.0], [False, True, True], 0.0, 0.5) == [False, False, True]
