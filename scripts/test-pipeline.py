@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageChops, ImageDraw
 
 from video_common import atomic_write_json, atomic_write_text
 
@@ -540,6 +540,13 @@ def main() -> None:
         atomic_write_json(timeline_path, timeline)
         with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
             meetup_video.check(loaded_project, project)
+        expected_card_header = Image.open(project.parent / "background.png").resize(
+            (1920, 1080), Image.Resampling.LANCZOS
+        ).convert("RGB").crop((0, 0, 1920, 250))
+        actual_card_header = Image.open(
+            project.parent / "build/faq-analysis/fixture/cards/faq-01-full-cover.png"
+        ).convert("RGB").crop((0, 0, 1920, 250))
+        assert ImageChops.difference(actual_card_header, expected_card_header).getbbox() is None
         run(*command, "preview", "--duration", str(DURATION))
         preview = project.parent / "output/debug/previews/preview-1080p.mp4"
         run(

@@ -70,6 +70,38 @@ def faq_label(project: dict) -> str:
     return "FRAGE AUS DEM PUBLIKUM" if str(project.get("language", "de")).lower().startswith("de") else "AUDIENCE QUESTION"
 
 
+def render_faq_card(project: dict, question: str, image: Path) -> None:
+    command = [
+        sys.executable,
+        str(ROOT / "scripts/make-faq-card.py"),
+        question,
+        str(image),
+        "--background",
+        str(resolve_project_path(project, project["background"])),
+        "--label",
+        faq_label(project),
+        "--accent",
+        str(project.get("faq_accent", "#eb0028")),
+    ]
+    faq_font = project.get("faq_font")
+    if not faq_font and "faq_label" not in project and LEGACY_MACOS_FAQ_FONT.exists():
+        faq_font = str(LEGACY_MACOS_FAQ_FONT)
+    if faq_font:
+        command.extend(["--font", str(resolve_project_path(project, str(faq_font)))])
+    run(command)
+
+
+def refresh_faq_cards(project: dict) -> None:
+    timeline = json.loads(resolve_project_path(project, project["faq"]).read_text(encoding="utf-8"))
+    entries = timeline.get("entries", [])
+    for entry in entries:
+        question = str(entry.get("question", "")).strip()
+        if not question or not entry.get("image"):
+            raise SystemExit(f"invalid FAQ card entry: {entry}")
+        render_faq_card(project, question, resolve_project_path(project, entry["image"]))
+    print(f"refreshed {len(entries)} FAQ cards")
+
+
 def review_identity(
     project: dict,
     video: Path,
@@ -797,26 +829,7 @@ def write_outputs(
         if show_card:
             faq_number += 1
             image = cards_dir / f"faq-{faq_number:02d}-full-cover.png"
-            card_command = [
-                sys.executable,
-                str(ROOT / "scripts/make-faq-card.py"),
-                turn["question"],
-                str(image),
-                "--background",
-                str(resolve_project_path(project, project["background"])),
-                "--label",
-                faq_label(project),
-                "--accent",
-                str(project.get("faq_accent", "#eb0028")),
-            ]
-            faq_font = project.get("faq_font")
-            if not faq_font and "faq_label" not in project and LEGACY_MACOS_FAQ_FONT.exists():
-                faq_font = str(LEGACY_MACOS_FAQ_FONT)
-            if faq_font:
-                card_command.extend(
-                    ["--font", str(resolve_project_path(project, str(faq_font)))]
-                )
-            run(card_command)
+            render_faq_card(project, turn["question"], image)
             faq_entries.append(
                 {
                     "source_start": round(answer_start, 6),
@@ -905,6 +918,7 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=MAX_ANALYSIS_WORKERS)
     parser.add_argument("--threads", type=int)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--cards-only", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
@@ -913,6 +927,9 @@ def main() -> None:
 
     project = json.loads(args.project.read_text(encoding="utf-8"))
     project["_project_dir"] = str(args.project.resolve().parent)
+    if args.cards_only:
+        refresh_faq_cards(project)
+        return
     if project.get("whisper_binary"):
         WHISPER = resolve_project_path(project, project["whisper_binary"])
     if project.get("whisper_model"):

@@ -805,6 +805,7 @@ def validate_privacy_render(path: Path, project: dict, resolution: str) -> None:
 
 
 def check(project: dict, project_file: Path, final: bool = False) -> None:
+    refresh_faq_cards(project, project_file)
     ensure_slides_text(project)
     keys = (
         "video",
@@ -1072,6 +1073,7 @@ def privacy_preflight(
     force: bool = False,
     identity: dict | None = None,
 ) -> Path:
+    refresh_faq_cards(project, project_file)
     identity = identity or render_identity(project)
     seal = privacy_preflight_path(project)
     if not force:
@@ -1406,6 +1408,21 @@ def build_faq(project: dict, project_file: Path, analyzer: str | None = None) ->
     subprocess.run(command, check=True)
 
 
+def refresh_faq_cards(project: dict, project_file: Path) -> None:
+    if not project_path(project, "faq").is_file() or not project_path(project, "background").is_file():
+        return
+    subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "scripts/build-faq.py"),
+            "--project",
+            str(project_file),
+            "--cards-only",
+        ],
+        check=True,
+    )
+
+
 def build_audio(project: dict, project_file: Path, analyzer: str | None = None) -> None:
     resources = project["_resources"]
     command = [
@@ -1543,6 +1560,7 @@ def main() -> None:
     elif args.command == "privacy-preflight":
         privacy_preflight(project, args.project, force=args.force)
     elif args.command == "preview":
+        refresh_faq_cards(project, args.project)
         start = args.start if args.start is not None else float(project["presentation_start"])
         output = (
             args.output.resolve()
@@ -1623,6 +1641,8 @@ def main() -> None:
         if project.get("rebuild_analysis_before_final", True):
             build_audio(project, args.project, args.analyzer)
             build_faq(project, args.project, args.analyzer)
+        else:
+            refresh_faq_cards(project, args.project)
         if args.command == "release":
             publishing_copy(project, args.project, args.analyzer)
         final_render(project, args.project)
