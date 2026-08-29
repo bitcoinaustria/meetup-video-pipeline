@@ -300,6 +300,8 @@ def main() -> None:
             "Example meetup",
             "--event-url",
             "https://example.com/events/meetup",
+            "--template",
+            "own-your-ai",
             "--video",
             str(raw_video),
             "--slides-pdf",
@@ -307,6 +309,13 @@ def main() -> None:
         )
         initialized_project = json.loads(initialized.read_text(encoding="utf-8"))
         assert initialized_project["event_url"] == "https://example.com/events/meetup"
+        assert initialized_project["organization_template"] == "own-your-ai"
+        assert initialized_project["organization"] == "Own Your AI"
+        assert initialized_project["organization_url"] == "https://luma.com/ownyourai"
+        assert initialized_project["announcement_label"] == "Community announcement"
+        for key in ("background", "shorts_logo"):
+            assert initialized_project[key].startswith("assets/")
+            assert (initialized.parent / initialized_project[key]).is_file()
         assert (initialized.parent / initialized_project["video"]).resolve() == raw_video
         assert (initialized.parent / initialized_project["slides_pdf"]).resolve() == raw_slides
         for artifact in ("manual-edits.json", "final-edits.json", "faq-timeline.json"):
@@ -346,6 +355,24 @@ def main() -> None:
         )
         assert rejected.returncode and "absolute HTTP(S) URL" in rejected.stderr
         assert not invalid.parent.exists()
+        invalid_template = temporary_path / "invalid-template/project.json"
+        rejected = subprocess.run(
+            [
+                sys.executable,
+                str(ROOT / "scripts/meetup-video.py"),
+                "--project",
+                str(invalid_template),
+                "init",
+                "--name",
+                "Invalid template",
+                "--template",
+                "../own-your-ai",
+            ],
+            capture_output=True,
+            text=True,
+        )
+        assert rejected.returncode and "invalid organization template" in rejected.stderr
+        assert not invalid_template.parent.exists()
         missing = temporary_path / "missing/project.json"
         rejected = subprocess.run(
             [
@@ -370,6 +397,14 @@ def main() -> None:
         assert spec and spec.loader
         meetup_video = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(meetup_video)
+        assert meetup_video.append_publisher_attribution(
+            {"organization": "Own Your AI", "organization_url": "https://luma.com/ownyourai"},
+            "Description",
+        ) == "Description\n\nOwn Your AI: https://luma.com/ownyourai"
+        assert meetup_video.append_publisher_attribution(
+            {"organization": "Own Your AI", "organization_url": "https://luma.com/ownyourai"},
+            "Description https://luma.com/ownyourai",
+        ) == "Description https://luma.com/ownyourai"
         assert meetup_video.audio_render_policy(
             {
                 "channel_analysis": {

@@ -1,0 +1,18 @@
+{
+  "assets": [
+    "background",
+    "shorts_logo"
+  ],
+  "organization": "Own Your AI",
+  "organization_url": "https://luma.com/ownyourai",
+  "x_handle": "",
+  "publishing_voice": "Own Your AI: technically literate, direct, practical, sober, and grounded in the recorded event; confident without hype",
+  "announcement_channel": "community channels",
+  "announcement_label": "Community announcement",
+  "announcement_max_length": 500,
+  "background": "background.png",
+  "shorts_logo": "logo.png",
+  "shorts_logo_width": 180,
+  "shorts_logo_opacity": 0.7,
+  "faq_accent": "#b8b8b8"
+}

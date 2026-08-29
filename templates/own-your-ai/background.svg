@@ -1,0 +1,33 @@
+<svg width="3840" height="2160" viewBox="0 0 3840 2160" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Own Your AI presentation background</title>
+  <desc>Dark presentation background with the official community mark and general Luma link.</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="3840" y2="2160" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#050505"/>
+      <stop offset="0.55" stop-color="#101010"/>
+      <stop offset="1" stop-color="#020202"/>
+    </linearGradient>
+    <radialGradient id="light" cx="0" cy="0" r="1" gradientUnits="userSpaceOnUse" gradientTransform="translate(2750 890) rotate(154) scale(1900 1250)">
+      <stop stop-color="#3d3d3d" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#111111" stop-opacity="0"/>
+    </radialGradient>
+    <pattern id="grid" width="160" height="160" patternUnits="userSpaceOnUse">
+      <path d="M160 0H0V160" stroke="#ffffff" stroke-opacity="0.025" stroke-width="2"/>
+    </pattern>
+  </defs>
+  <rect width="3840" height="2160" fill="url(#background)"/>
+  <rect width="3840" height="2160" fill="url(#light)"/>
+  <rect width="3840" height="2160" fill="url(#grid)"/>
+  <path d="M0 2010L1200 810L2160 1770L3840 90" stroke="#ffffff" stroke-opacity="0.025" stroke-width="36"/>
+  <path d="M430 2160L2110 480L2950 1320L3840 430" stroke="#ffffff" stroke-opacity="0.018" stroke-width="12"/>
+  <g aria-label="Community link">
+    <circle cx="128" cy="120" r="11" fill="#d9d9d9"/>
+    <circle cx="128" cy="120" r="27" stroke="#d9d9d9" stroke-opacity="0.36" stroke-width="3"/>
+    <text x="184" y="143" fill="#f1f1f1" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="64" font-weight="500" letter-spacing="1">luma.com/ownyourai</text>
+  </g>
+  <g aria-label="Own Your AI brand">
+    <text x="3450" y="143" text-anchor="end" fill="#f1f1f1" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="68" font-weight="650" letter-spacing="5">OWN YOUR AI</text>
+    <image href="logo.png" x="3510" y="30" width="180" height="180" preserveAspectRatio="xMidYMid meet"/>
+  </g>
+  <rect x="80" y="228" width="3680" height="2" fill="#ffffff" fill-opacity="0.12"/>
+</svg>

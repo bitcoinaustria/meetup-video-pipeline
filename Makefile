@@ -6,7 +6,7 @@ RUN := $(PYTHON) scripts/meetup-video.py --project "$(PROJECT)" $(if $(ANALYZER)
 
 init:
 	test -n "$(NAME)"
-	$(PYTHON) scripts/meetup-video.py --project "projects/$(NAME)/project.json" init --name "$(NAME)" $(if $(EVENT_URL),--event-url "$(EVENT_URL)")
+	$(PYTHON) scripts/meetup-video.py --project "projects/$(NAME)/project.json" init --name "$(NAME)" $(if $(EVENT_URL),--event-url "$(EVENT_URL)") $(if $(TEMPLATE),--template "$(TEMPLATE)")
 
 capabilities:
 	$(RUN) capabilities

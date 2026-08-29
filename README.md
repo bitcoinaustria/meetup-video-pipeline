@@ -2,7 +2,7 @@
 
 Local-first tooling for turning meetup camera footage plus a slide deck, screen recording, or both into branded long-form video and vertical clips. The pipeline combines clean presentation visuals, smooth speaker tracking, fail-closed privacy blurring, conservative speech edits, full-cover FAQ cards, subtitles, chapters, thumbnails, and publishing copy without a traditional video editor.
 
-The included templates use Bitcoin Austria branding as a working example. Replace the background, logo, publishing voice, and organization fields for another organizer.
+The included templates use Bitcoin Austria branding as the default example and provide a separate Own Your AI profile. A named organization template supplies the logo, background, publisher link, publishing channel, and voice without mixing organizer identity with the speaker's affiliation.
 
 The generator is presentation-neutral and host-portable: event facts, source paths, terminology, timing, review decisions, and output names live in a project manifest and its project folder. FFmpeg encoding is selected automatically for the current machine. Apple Vision is the qualified macOS privacy/OCR backend; other platforms must configure a detector that passes the same TSV recall gates.
 
@@ -69,6 +69,20 @@ browse or choose an agent independently.
 
 Paths in a manifest resolve relative to that manifest, so a complete project folder can be
 archived to shared storage and restored on another checkout.
+
+Reusable organization templates live under `templates/<name>/`. Initialize any number of local,
+globally ignored projects from one operator checkout with `TEMPLATE=<name>`; the small brand assets
+are copied into each project so the resulting folder remains portable:
+
+```sh
+make init NAME=my-talk TEMPLATE=own-your-ai EVENT_URL=https://luma.com/example
+```
+
+The event URL remains talk-specific. Each template's background carries its stable community
+link, while `organization_url` guarantees that link in publishing copy. `speaker_affiliation`
+records the speaker's company or institution without treating it as the publisher. Announcement
+channel and length are template settings, so organizers without an X account do not get invented
+social or repository links.
 
 The initial camera/slide calibration produces the timeline, slide images, speaker track, and two privacy masks referenced by the manifest. These physical-camera values stay project-specific; the render and edit pipeline never assumes one event's crop or speaker position applies to another. See the [agent production runbook](.agents/skills/meetup-video-production/SKILL.md) for the exact gates and artifact contract.
 
