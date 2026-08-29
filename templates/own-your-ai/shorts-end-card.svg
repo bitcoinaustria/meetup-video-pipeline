@@ -1,0 +1,18 @@
+<svg width="1080" height="1920" viewBox="0 0 1080 1920" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <title>Own Your AI Shorts meetup end card</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1080" y2="1920" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#050505"/>
+      <stop offset="0.58" stop-color="#181818"/>
+      <stop offset="1" stop-color="#030303"/>
+    </linearGradient>
+  </defs>
+  <rect width="1080" height="1920" fill="url(#bg)"/>
+  <image href="logo.png" x="320" y="205" width="440" height="440" preserveAspectRatio="xMidYMid meet"/>
+  <text x="540" y="835" text-anchor="middle" fill="#f5f5f5" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="106" font-weight="700">JOIN US</text>
+  <text x="540" y="955" text-anchor="middle" fill="#f5f5f5" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="106" font-weight="700">IN PERSON</text>
+  <text x="540" y="1100" text-anchor="middle" fill="#d7d7d7" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="56" font-weight="500">Own Your AI · Vienna</text>
+  <rect x="110" y="1250" width="860" height="150" rx="75" fill="#f3f3f3"/>
+  <text x="540" y="1348" text-anchor="middle" fill="#080808" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="49" font-weight="650">luma.com/ownyourai</text>
+  <text x="540" y="1580" text-anchor="middle" fill="#a9a9a9" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="38" font-weight="450">TALKS · Q&amp;A · COMMUNITY</text>
+</svg>

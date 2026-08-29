@@ -1,7 +1,9 @@
 {
   "assets": [
     "background",
-    "shorts_logo"
+    "shorts_logo",
+    "end_card",
+    "shorts_end_card"
   ],
   "organization": "Own Your AI",
   "organization_url": "https://luma.com/ownyourai",
@@ -10,7 +12,13 @@
   "announcement_channel": "community channels",
   "announcement_label": "Community announcement",
   "announcement_max_length": 500,
+  "publishing_intro": "Join the next Own Your AI meetup in Vienna: https://luma.com/ownyourai",
+  "pinned_comment": "Join us at the next Own Your AI meetup in Vienna: https://luma.com/ownyourai",
   "background": "background.png",
+  "end_card": "end-card.png",
+  "end_card_duration": 6.0,
+  "shorts_end_card": "shorts-end-card.png",
+  "shorts_end_card_duration": 2.5,
   "shorts_logo": "logo.png",
   "shorts_logo_width": 180,
   "shorts_logo_opacity": 0.7,

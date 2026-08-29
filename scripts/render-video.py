@@ -363,6 +363,8 @@ def main() -> None:
     parser.add_argument("--full-blur-mask", type=Path)
     parser.add_argument("--edl", type=Path, help="Approved automatic audio/video edits.")
     parser.add_argument("--faq-timeline", type=Path, help="Full-cover FAQ cards in source time.")
+    parser.add_argument("--end-card", type=Path)
+    parser.add_argument("--end-card-duration", type=float, default=0.0)
     parser.add_argument("--encoder", default="libx264")
     parser.add_argument("--preset")
     parser.add_argument("--resolution", choices=("3840x2160", "1920x1080"), default="3840x2160")
@@ -384,7 +386,7 @@ def main() -> None:
         raise SystemExit("--video is required")
     for name in (
         "video", "project_dir", "timeline", "background", "slides", "output",
-        "privacy_mask", "full_blur_mask", "edl", "faq_timeline",
+        "privacy_mask", "full_blur_mask", "edl", "faq_timeline", "end_card",
     ):
         value = getattr(args, name)
         if value is not None:
@@ -393,6 +395,10 @@ def main() -> None:
         raise SystemExit("--full-blur-mask requires --privacy-mask")
     if args.privacy_mask and args.start < args.privacy_mask_start:
         raise SystemExit("render starts before the privacy mask")
+    if args.end_card_duration < 0 or bool(args.end_card) != (args.end_card_duration > 0):
+        raise SystemExit("--end-card and a positive --end-card-duration are required together")
+    if args.end_card and not args.end_card.is_file():
+        raise SystemExit(f"end card is missing: {args.end_card}")
 
     timeline = json.loads(args.timeline.read_text(encoding="utf-8"))
     validate_timeline(timeline)
@@ -736,6 +742,21 @@ def main() -> None:
     )
     video_label, audio_label = "syncv", "synca"
 
+    final_duration = output_duration
+    if args.end_card:
+        end_card_input = 3 + int(bool(args.privacy_mask)) + int(bool(args.full_blur_mask)) + len(faq_entries)
+        filter_graph += (
+            f";[{audio_label}]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[contenta]"
+            f";[{end_card_input}:v]scale={output_width}:{output_height}:force_original_aspect_ratio=decrease,"
+            f"pad={output_width}:{output_height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,"
+            f"trim=duration={args.end_card_duration:.6f},setpts=PTS-STARTPTS[endcardv]"
+            f";anullsrc=r=48000:cl=stereo,atrim=duration={args.end_card_duration:.6f},"
+            "aformat=sample_fmts=fltp,asetpts=PTS-STARTPTS[endcarda]"
+            f";[{video_label}][contenta][endcardv][endcarda]concat=n=2:v=1:a=1[withcardv][withcarda]"
+        )
+        video_label, audio_label = "withcardv", "withcarda"
+        final_duration += args.end_card_duration
+
     video_map = f"[{video_label}]"
     audio_map = f"[{audio_label}]" if audio_label else "0:a:0"
 
@@ -761,6 +782,8 @@ def main() -> None:
         command.extend(("-i", str(args.full_blur_mask)))
     for entry in faq_entries:
         command.extend(("-loop", "1", "-framerate", "30", "-i", str(entry["image"])))
+    if args.end_card:
+        command.extend(("-loop", "1", "-framerate", "30", "-i", str(args.end_card)))
     command.extend((
         "-filter_complex", filter_graph,
         "-map", video_map, "-map", audio_map,
@@ -774,7 +797,7 @@ def main() -> None:
     ))
     if cuts or faq_entries or audio_label:
         command.extend(("-b:a", "192k"))
-    command.extend(("-movflags", "+faststart", "-t", f"{output_duration:.6f}"))
+    command.extend(("-movflags", "+faststart", "-t", f"{final_duration:.6f}"))
     command.append(str(args.output))
     subprocess.run(command, check=True, cwd=build)
 

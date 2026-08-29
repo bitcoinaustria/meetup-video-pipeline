@@ -1,6 +1,6 @@
 <svg width="3840" height="2160" viewBox="0 0 3840 2160" fill="none" xmlns="http://www.w3.org/2000/svg">
   <title>Own Your AI presentation background</title>
-  <desc>Dark presentation background with the official community mark and general Luma link.</desc>
+  <desc>Dark presentation background with the official community mark and an in-person meetup call to action.</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="3840" y2="2160" gradientUnits="userSpaceOnUse">
       <stop stop-color="#050505"/>
@@ -23,7 +23,7 @@
   <g aria-label="Community link">
     <circle cx="128" cy="120" r="11" fill="#d9d9d9"/>
     <circle cx="128" cy="120" r="27" stroke="#d9d9d9" stroke-opacity="0.36" stroke-width="3"/>
-    <text x="184" y="143" fill="#f1f1f1" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="64" font-weight="500" letter-spacing="1">luma.com/ownyourai</text>
+    <text x="184" y="140" fill="#f1f1f1" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="52" font-weight="600" letter-spacing="1.5">JOIN THE NEXT MEETUP · VIENNA · luma.com/ownyourai</text>
   </g>
   <g aria-label="Own Your AI brand">
     <text x="3450" y="143" text-anchor="end" fill="#f1f1f1" font-family="Inter, Helvetica Neue, Arial, sans-serif" font-size="68" font-weight="650" letter-spacing="5">OWN YOUR AI</text>

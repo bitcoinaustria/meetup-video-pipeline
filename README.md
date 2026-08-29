@@ -82,7 +82,9 @@ The event URL remains talk-specific. Each template's background carries its stab
 link, while `organization_url` guarantees that link in publishing copy. `speaker_affiliation`
 records the speaker's company or institution without treating it as the publisher. Announcement
 channel and length are template settings, so organizers without an X account do not get invented
-social or repository links.
+social or repository links. Templates may set `end_card`/`end_card_duration` and
+`shorts_end_card`/`shorts_end_card_duration`; the silent cards are appended after the shared EDL,
+so they do not change source-time cuts, tracking, privacy masks, chapters, or subtitle timing.
 
 The initial camera/slide calibration produces the timeline, slide images, speaker track, and two privacy masks referenced by the manifest. These physical-camera values stay project-specific; the render and edit pipeline never assumes one event's crop or speaker position applies to another. See the [agent production runbook](.agents/skills/meetup-video-production/SKILL.md) for the exact gates and artifact contract.
 

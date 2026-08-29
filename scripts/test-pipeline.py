@@ -10,6 +10,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -86,6 +87,9 @@ def fixture(directory: Path) -> Path:
 
     background = Image.new("RGB", (1920, 1080), "#171717")
     background.save(directory / "background.png")
+    Image.new("RGB", (1920, 1080), "#7020df").save(directory / "end-card.png")
+    Image.new("RGBA", (240, 240), "#ffffff").save(directory / "shorts-logo.png")
+    Image.new("RGB", (1080, 1920), "#20df20").save(directory / "shorts-end-card.png")
     slide = Image.new("RGB", (1920, 1080), "#df2020")
     draw = ImageDraw.Draw(slide)
     draw.rectangle((120, 120, 1800, 960), outline="#eb0028", width=20)
@@ -233,6 +237,11 @@ def fixture(directory: Path) -> Path:
         "slides_pdf": "source/slides.pdf",
         "slides_text": "tmp/slides.txt",
         "background": "background.png",
+        "end_card": "end-card.png",
+        "end_card_duration": 0.25,
+        "shorts_logo": "shorts-logo.png",
+        "shorts_end_card": "shorts-end-card.png",
+        "shorts_end_card_duration": 0.25,
         "timeline": "build/timeline.json",
         "slides": "build/slides",
         "edl": "final-edits.json",
@@ -313,9 +322,11 @@ def main() -> None:
         assert initialized_project["organization"] == "Own Your AI"
         assert initialized_project["organization_url"] == "https://luma.com/ownyourai"
         assert initialized_project["announcement_label"] == "Community announcement"
-        for key in ("background", "shorts_logo"):
+        for key in ("background", "shorts_logo", "end_card", "shorts_end_card"):
             assert initialized_project[key].startswith("assets/")
             assert (initialized.parent / initialized_project[key]).is_file()
+        assert initialized_project["end_card_duration"] == 6.0
+        assert initialized_project["shorts_end_card_duration"] == 2.5
         assert (initialized.parent / initialized_project["video"]).resolve() == raw_video
         assert (initialized.parent / initialized_project["slides_pdf"]).resolve() == raw_slides
         for artifact in ("manual-edits.json", "final-edits.json", "faq-timeline.json"):
@@ -405,6 +416,14 @@ def main() -> None:
             {"organization": "Own Your AI", "organization_url": "https://luma.com/ownyourai"},
             "Description https://luma.com/ownyourai",
         ) == "Description https://luma.com/ownyourai"
+        assert meetup_video.decorate_publishing_description(
+            {
+                "organization": "Own Your AI",
+                "organization_url": "https://luma.com/ownyourai",
+                "publishing_intro": "Join us: https://luma.com/ownyourai",
+            },
+            "Description",
+        ) == "Join us: https://luma.com/ownyourai\n\nDescription"
         assert meetup_video.audio_render_policy(
             {
                 "channel_analysis": {
@@ -612,6 +631,39 @@ def main() -> None:
             text=True,
         )
         assert int(level.stdout.strip()) <= 42, level.stdout
+        shorts_spec = importlib.util.spec_from_file_location(
+            "render_shorts", ROOT / "scripts/render-shorts.py"
+        )
+        assert shorts_spec and shorts_spec.loader
+        render_shorts = importlib.util.module_from_spec(shorts_spec)
+        shorts_spec.loader.exec_module(render_shorts)
+        short_output = project.parent / "output/shorts/cta-test.mp4"
+        short_output.parent.mkdir(parents=True, exist_ok=True)
+        short_project = {**loaded_project, "_video_encoder": "libx264", "_render_threads": 2}
+
+        def fake_subtitles(_transcript, path, _replacements=None):
+            path.write_text("1\n00:00:00,000 --> 00:00:00,500\nTest\n", encoding="utf-8")
+
+        with (
+            patch.object(render_shorts, "transcribe", return_value=[]),
+            patch.object(render_shorts, "make_subtitles", side_effect=fake_subtitles),
+        ):
+            render_shorts.render_clip(
+                project.parent / "source/video.mp4",
+                final,
+                project.parent / "shorts-logo.png",
+                project.parent / "shorts-end-card.png",
+                0.25,
+                project.parent / "build/privacy/mask.mp4",
+                project.parent / "build/privacy/full-blur.mp4",
+                {"id": "cta-test", "source_start": 2.6, "duration": 0.5},
+                short_project,
+                short_output,
+                project.parent / "build/shorts-test",
+                threading.Semaphore(1),
+            )
+        short_green = sample_pixel(short_output, 540, 960, 0.65)
+        assert short_green[1] > short_green[0] + 100 and short_green[1] > short_green[2] + 100
         packet_times = [
             float(value)
             for value in subprocess.run(

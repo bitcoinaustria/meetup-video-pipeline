@@ -304,6 +304,8 @@ def render_clip(
     raw_video: Path,
     final_video: Path,
     logo_source: Path,
+    end_card: Path | None,
+    end_card_duration: float,
     privacy_mask: Path,
     full_blur_mask: Path,
     clip: dict,
@@ -375,7 +377,7 @@ def render_clip(
         f"[2:v]format=gray,scale={crop_width:.3f}:{crop_height:.3f}[full_blur_mask];"
         "[blurred_full][full_blur_mask]alphamerge[blurred_full_alpha];"
         "[partially_private][blurred_full_alpha]overlay[private_native];"
-        f"[private_native]scale={WIDTH}:{HEIGHT}:flags=lanczos,format=yuv420p[outv]"
+        f"[private_native]scale={WIDTH}:{HEIGHT}:flags=lanczos,fps=30,format=yuv420p[outv]"
     )
     mask_offset = source_start - float(project["presentation_start"])
     private_video = clip_build / "private.mp4"
@@ -398,34 +400,64 @@ def render_clip(
         *encoding,
         "-threads", render_threads,
         "-enc_time_base", "1:30",
-        "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
+        "-pix_fmt", "yuv420p", "-fps_mode", "cfr",
         "-movflags", "+faststart", str(private_video),
     ])
     run([
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
         "-ss", f"{final_start:.3f}", "-i", str(final_video), "-t", f"{duration:.3f}", "-vn",
-        "-af", "loudnorm=I=-14:TP=-1.5:LRA=7,aresample=48000",
+        "-af", "loudnorm=I=-14:TP=-1.5:LRA=7,aresample=48000,asetpts=N/SR/TB",
         "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "48000",
         "-threads", render_threads, str(normalized_audio),
     ])
     temporary_output = output.with_name(f".{output.stem}.tmp{output.suffix}")
     try:
-        run([
+        command = [
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
             "-i", str(private_video), "-i", str(normalized_audio),
             "-loop", "1", "-framerate", "30", "-i", str(logo_source),
-            "-filter_complex_threads", render_threads,
-            "-filter_complex", f"[2:v]scale={int(project.get('shorts_logo_width', 180))}:-1,format=rgba,"
+        ]
+        if end_card:
+            command.extend(("-loop", "1", "-framerate", "30", "-i", str(end_card)))
+        filter_graph = f"[2:v]scale={int(project.get('shorts_logo_width', 180))}:-1,format=rgba,"
+        filter_graph += (
             f"colorchannelmixer=aa={float(project.get('shorts_logo_opacity', 0.55)):.3f}[mark];"
-            "[0:v][mark]overlay=48:48:eof_action=pass[outv]",
-            "-map", "[outv]", "-map", "1:a:0", "-t", f"{duration:.3f}",
+            "[0:v][mark]overlay=48:48:eof_action=pass[branded]"
+        )
+        final_duration = duration
+        audio_encoding = ["-c:a", "copy"]
+        if end_card:
+            filter_graph += (
+                f";[branded]trim=duration={duration:.6f},setpts=PTS-STARTPTS[clipv]"
+                f";[1:a]atrim=duration={duration:.6f},aresample=48000,"
+                "aformat=sample_fmts=fltp:channel_layouts=stereo,asetpts=PTS-STARTPTS[clipa]"
+                f";[3:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=decrease,"
+                f"pad={WIDTH}:{HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=yuv420p,"
+                f"trim=duration={end_card_duration:.6f},setpts=PTS-STARTPTS[endcardv]"
+                f";anullsrc=r=48000:cl=stereo,atrim=duration={end_card_duration:.6f},"
+                "aformat=sample_fmts=fltp,asetpts=PTS-STARTPTS[endcarda]"
+                ";[clipv][clipa][endcardv][endcarda]concat=n=2:v=1:a=1[outv][outa]"
+            )
+            audio_map = "[outa]"
+            audio_encoding = ["-c:a", "aac", "-b:a", "192k"]
+            final_duration += end_card_duration
+        else:
+            filter_graph += ";[branded]null[outv]"
+            audio_map = "1:a:0"
+        command.extend((
+            "-filter_complex_threads", render_threads,
+            "-filter_complex", filter_graph,
+            "-map", "[outv]", "-map", audio_map, "-t", f"{final_duration:.3f}",
+        ))
+        command.extend((
             *encoding,
             "-threads", render_threads,
             "-enc_time_base", "1:30",
-            "-pix_fmt", "yuv420p", "-fps_mode", "passthrough",
-            "-c:a", "copy", "-movflags", "+faststart", str(temporary_output),
-        ])
-        validate(temporary_output, duration)
+            "-pix_fmt", "yuv420p", "-fps_mode", "cfr",
+            *audio_encoding, "-movflags", "+faststart", str(temporary_output),
+        ))
+        run(command)
+        validate(temporary_output, final_duration)
         temporary_output.replace(output)
         temporary_srt.replace(srt)
     finally:
@@ -498,9 +530,18 @@ def main() -> None:
     if not project["_final_render_identity"]:
         raise SystemExit("final render metadata has no identity; rerun final")
     logo_source = project_path(project, "shorts_logo")
+    try:
+        end_card_duration = float(project.get("shorts_end_card_duration", 0))
+    except (TypeError, ValueError) as error:
+        raise SystemExit("shorts_end_card_duration must be a number") from error
+    end_card = project_path(project, "shorts_end_card") if project.get("shorts_end_card") else None
+    if end_card_duration < 0 or bool(end_card) != (end_card_duration > 0):
+        raise SystemExit("shorts_end_card and a positive shorts_end_card_duration are required together")
     privacy_mask = project_path(project, "privacy_mask")
     full_blur_mask = project_path(project, "full_blur_mask")
     required = (raw_video, final_video, logo_source, privacy_mask, full_blur_mask, WHISPER, WHISPER_MODEL)
+    if end_card:
+        required += (end_card,)
     if not all(path.exists() for path in required):
         raise SystemExit("source video, final audio, logo source, privacy masks, or Whisper Large-v3 is missing")
 
@@ -532,7 +573,8 @@ def main() -> None:
         index, clip = item
         output = output_dir / short_output_name(index, clip)
         render_clip(
-            raw_video, final_video, logo_source, privacy_mask, full_blur_mask,
+            raw_video, final_video, logo_source, end_card, end_card_duration,
+            privacy_mask, full_blur_mask,
             clip, project, output, build, gpu_slots,
         )
         return output
@@ -563,6 +605,7 @@ def main() -> None:
                     "title": clip["title"],
                     "source_start": clip["source_start"],
                     "duration": clip["duration"],
+                    "output_duration": float(clip["duration"]) + end_card_duration,
                     "video": str(output.relative_to(project_dir)),
                     "subtitles": str(output.with_suffix(".srt").relative_to(project_dir)),
                 }

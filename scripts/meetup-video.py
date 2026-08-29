@@ -51,7 +51,7 @@ from video_common import (
 
 ROOT = Path(__file__).resolve().parent.parent
 GIB = 1024**3
-RENDER_CONTRACT_VERSION = 1  # Bump when shared helpers change encoded output.
+RENDER_CONTRACT_VERSION = 2  # Bump when shared helpers change encoded output.
 
 
 def load_project(path: Path) -> dict:
@@ -197,6 +197,24 @@ def append_publisher_attribution(project: dict, description: str) -> str:
     return f"{prefix}{project['organization']}: {url}"
 
 
+def decorate_publishing_description(project: dict, description: str) -> str:
+    intro = str(project.get("publishing_intro", "")).strip()
+    body = description.strip()
+    if intro and intro not in body:
+        body = f"{intro}\n\n{body}" if body else intro
+    return append_publisher_attribution(project, body)
+
+
+def end_card_duration(project: dict) -> float:
+    try:
+        seconds = float(project.get("end_card_duration", 0))
+    except (TypeError, ValueError) as error:
+        raise SystemExit("end_card_duration must be a number") from error
+    if seconds < 0 or bool(project.get("end_card")) != (seconds > 0):
+        raise SystemExit("end_card and a positive end_card_duration must be configured together")
+    return seconds
+
+
 def slide_titles(slides_text: Path, presentation_title: str) -> dict[int, str]:
     titles = {}
     for page, content in enumerate(slides_text.read_text(encoding="utf-8").split("\f"), start=1):
@@ -335,7 +353,7 @@ def expected_render_duration(project: dict) -> float:
     edits, faq = timeline_data(project)
     timeline = json.loads(project_path(project, "timeline").read_text(encoding="utf-8"))
     start, end = presentation_bounds(project, float(timeline["duration"]))
-    return source_range_output_duration(start, end - start, edits, faq)
+    return source_range_output_duration(start, end - start, edits, faq) + end_card_duration(project)
 
 
 def render_identity(project: dict) -> dict:
@@ -358,6 +376,8 @@ def render_identity(project: dict) -> dict:
         for name, path in participant_track_paths(project, timeline).items()
     }
     files["renderer"] = fingerprint("renderer", ROOT / "scripts/render-video.py")
+    if project.get("end_card"):
+        files["end_card"] = fingerprint("end-card", project_path(project, "end_card"))
     audio_edits = optional_project_path(project, "audio_edits")
     if audio_edits and audio_edits.exists():
         files["audio_edits"] = fingerprint("audio-edits", audio_edits)
@@ -382,6 +402,7 @@ def render_identity(project: dict) -> dict:
         "render": {
             "contract": RENDER_CONTRACT_VERSION,
             "resolution": project.get("final_resolution", "3840x2160"),
+            "end_card_duration": end_card_duration(project),
             "encoder": profile["video_encoder"]["name"],
             "ffmpeg": profile["signature"]["ffmpeg_version"],
             "preview_preset": project.get("preview_preset", "ultrafast"),
@@ -804,6 +825,8 @@ def check(project: dict, project_file: Path, final: bool = False) -> None:
         keys += ("audio_edits",)
     if project.get("base_edits"):
         keys += ("base_edits",)
+    if end_card_duration(project):
+        keys += ("end_card",)
     missing = [str(project_path(project, key)) for key in keys if not project_path(project, key).exists()]
     if missing:
         raise SystemExit("missing inputs:\n" + "\n".join(missing))
@@ -951,6 +974,7 @@ def render(
     render_duration: float | None,
     output: Path,
     final: bool,
+    include_end_card: bool = False,
 ) -> float:
     if final:
         check(project, project_file, final=True)
@@ -965,6 +989,8 @@ def render(
         raise SystemExit("render duration must stay inside the presentation range")
     source_duration = presentation_end - start if render_duration is None else render_duration
     expected = source_range_output_duration(start, source_duration, edits, faq)
+    card_duration = end_card_duration(project) if include_end_card else 0
+    expected += card_duration
     audio_policy = "process_and_preserve_each_channel_separately"
     audio_edits = optional_project_path(project, "audio_edits")
     if audio_edits and audio_edits.exists():
@@ -1022,6 +1048,15 @@ def render(
         command.extend(("--preset", str(preset)))
     if render_duration is not None or presentation_end < timeline_duration:
         command.extend(("--duration", str(source_duration)))
+    if card_duration:
+        command.extend(
+            (
+                "--end-card",
+                str(project_path(project, "end_card")),
+                "--end-card-duration",
+                str(card_duration),
+            )
+        )
     subprocess.run(command, check=True)
     return expected
 
@@ -1218,6 +1253,7 @@ def final_render(project: dict, project_file: Path) -> None:
             None,
             temporary,
             final=True,
+            include_end_card=True,
         )
         seconds = validate_render(
             temporary,
@@ -1267,8 +1303,8 @@ def publishing_copy(project: dict, project_file: Path, analyzer: str | None = No
     announcement_max_length = int(project.get("announcement_max_length", 270))
     if not announcement_channel or not announcement_label or not 1 <= announcement_max_length <= 5000:
         raise SystemExit("publishing announcement configuration is invalid")
-    publisher_attribution = append_publisher_attribution(project, "")
-    description_max_length = 1800 - len(publisher_attribution) - (2 if publisher_attribution else 0)
+    decoration_length = len(decorate_publishing_description(project, "x")) - 1
+    description_max_length = 1800 - decoration_length
     if description_max_length < 1200:
         raise SystemExit("publisher attribution leaves too little room for the description")
     schema = {
@@ -1336,14 +1372,19 @@ Do not use markdown inside the three values.
     output.parent.mkdir(parents=True, exist_ok=True)
     chapters = chapters_text(project)
     chapter_block = f"\n\nKapitel\n{chapters}" if chapters else ""
-    description = append_publisher_attribution(project, copy["description"])
+    description = decorate_publishing_description(project, copy["description"])
+    pinned_comment = str(
+        project.get("pinned_comment", project.get("publishing_intro", ""))
+    ).strip()
+    pinned_block = f"\n\n## Pinned comment\n\n{pinned_comment}" if pinned_comment else ""
     atomic_write_text(
         output,
         "# Publishing copy\n\n"
         "Generated by the configured local analyzer. Review before publishing.\n\n"
         f"## YouTube title\n\n{copy['title']}\n\n"
         f"## YouTube description\n\n{description}{chapter_block}\n\n"
-        f"## {announcement_label}\n\n{copy['announcement_post']}\n",
+        f"## {announcement_label}\n\n{copy['announcement_post']}"
+        f"{pinned_block}\n",
     )
     print(output)
 
@@ -1509,7 +1550,15 @@ def main() -> None:
             else Path(project["_project_dir"]) / "output/debug/previews/preview-1080p.mp4"
         )
         output.parent.mkdir(parents=True, exist_ok=True)
-        expected = render(project, args.project, start, args.duration, output, final=False)
+        expected = render(
+            project,
+            args.project,
+            start,
+            args.duration,
+            output,
+            final=False,
+            include_end_card=True,
+        )
         validate_render(output, "1920x1080", expected)
         atomic_write_json(
             preview_approval_path(project),
