@@ -6,13 +6,9 @@ import json
 import os
 import re
 import subprocess
-import tempfile
-import textwrap
 import threading
 import time
 from pathlib import Path
-
-from PIL import Image, ImageDraw, ImageFont
 
 from video_common import (
     atomic_write_json,
@@ -143,43 +139,18 @@ def validate_clips(clips: list[dict]) -> list[dict]:
     for clip in clips:
         clip_id = str(clip.get("id", ""))
         title = str(clip.get("title", "")).strip()
-        hook = str(clip.get("hook", title)).strip()
         if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", clip_id):
             raise SystemExit(f"invalid Short id: {clip_id!r}")
         if clip_id in ids:
             raise SystemExit(f"duplicate Short id: {clip_id}")
         if not title or len(title) > 100:
             raise SystemExit(f"short {clip_id} title must contain 1 to 100 characters")
-        if not hook or len(hook) > 100:
-            raise SystemExit(f"short {clip_id} hook must contain 1 to 100 characters")
         ids.add(clip_id)
     return clips
 
 
 def short_output_name(index: int, clip: dict) -> str:
     return f"{index:02d}-{clip['id']}.mp4"
-
-
-def make_hook_image(text: str, output: Path, font: Path | None = None) -> None:
-    lines = textwrap.wrap(text, width=28)
-    if len(lines) > 3:
-        raise SystemExit("Short hook must fit on three lines")
-    image = Image.new("RGBA", (WIDTH, 360), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    hook_font = ImageFont.truetype(font, 48) if font else ImageFont.load_default(size=48)
-    draw.rounded_rectangle((48, 40, WIDTH - 48, 320), radius=26, fill=(0, 0, 0, 190))
-    draw.rounded_rectangle((48, 40, 58, 320), radius=5, fill="#eb0028")
-    draw.multiline_text(
-        (WIDTH / 2, 180),
-        "\n".join(lines),
-        font=hook_font,
-        fill="white",
-        spacing=12,
-        anchor="mm",
-        align="center",
-    )
-    output.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output)
 
 
 def automatic_pan(
@@ -438,25 +409,15 @@ def render_clip(
         "-threads", render_threads, str(normalized_audio),
     ])
     temporary_output = output.with_name(f".{output.stem}.tmp{output.suffix}")
-    hook_image = clip_build / "hook.png"
-    configured_font = project.get("shorts_font", project.get("faq_font"))
-    make_hook_image(
-        str(clip.get("hook", clip["title"])),
-        hook_image,
-        resolve_project_path(project, configured_font) if configured_font else None,
-    )
     try:
         run([
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
             "-i", str(private_video), "-i", str(normalized_audio),
             "-loop", "1", "-framerate", "30", "-i", str(logo_source),
-            "-loop", "1", "-framerate", "30", "-i", str(hook_image),
             "-filter_complex_threads", render_threads,
             "-filter_complex", f"[2:v]scale={int(project.get('shorts_logo_width', 180))}:-1,format=rgba,"
             f"colorchannelmixer=aa={float(project.get('shorts_logo_opacity', 0.55)):.3f}[mark];"
-            "[3:v]format=rgba[hook];"
-            "[0:v][mark]overlay=48:48:eof_action=pass[branded];"
-            f"[branded][hook]overlay=0:180:enable='lt(t,{float(project.get('shorts_hook_seconds', 3.0)):.3f})'[outv]",
+            "[0:v][mark]overlay=48:48:eof_action=pass[outv]",
             "-map", "[outv]", "-map", "1:a:0", "-t", f"{duration:.3f}",
             *encoding,
             "-threads", render_threads,
@@ -600,7 +561,6 @@ def main() -> None:
                 {
                     "id": clip["id"],
                     "title": clip["title"],
-                    "hook": clip.get("hook", clip["title"]),
                     "source_start": clip["source_start"],
                     "duration": clip["duration"],
                     "video": str(output.relative_to(project_dir)),
@@ -638,11 +598,6 @@ def self_test() -> None:
         1,
     )
     assert pan[0][1] == 454 and pan[-1][1] == 574
-    with tempfile.TemporaryDirectory() as directory:
-        hook = Path(directory) / "hook.png"
-        make_hook_image("A useful Short title", hook)
-        with Image.open(hook) as image:
-            assert image.size == (WIDTH, 360) and image.mode == "RGBA"
     assert presentation_range_matches(
         {"presentation_start": 12.5, "presentation_end": 20.0},
         {"identity": {"presentation_start": 12.5, "presentation_end": 20.0}},

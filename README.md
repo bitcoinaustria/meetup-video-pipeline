@@ -202,7 +202,7 @@ output/
 Source media remains in the project's `source/` directory. Intermediate assets belong in `build/` or `tmp/`, not in `output/`.
 `make clean-debug PROJECT=...` removes the deletable review tree and legacy render-lock guards after approval; active locks live under `build/locks/`.
 
-Each approved Short needs a stable lowercase `id`, a publishable `title`, `source_start`, and `duration`. The renderer creates numbered readable 1080×1920 files, a matching SRT, and `output/metadata/shorts.json`. A `hook` can override the title shown briefly in the video. Crop and pan default to the reviewed speaker track; `crop_y` and `pan` remain optional manual overrides.
+Each approved Short needs a stable lowercase `id`, a publishable `title`, `source_start`, and `duration`. The renderer creates numbered readable 1080×1920 files, a matching SRT, and `output/metadata/shorts.json`. Titles remain in filenames and publishing metadata; no title or subtitles are burned into the video. Crop and pan default to the reviewed speaker track; `crop_y` and `pan` remain optional manual overrides.
 
 ## Safety and edit contract
 
