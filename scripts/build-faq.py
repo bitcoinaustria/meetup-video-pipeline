@@ -34,7 +34,7 @@ from video_common import (
 ROOT = Path(__file__).resolve().parent.parent
 WHISPER = ROOT / "build/whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL = Path.home() / ".cache/openwhispr/whisper-models/ggml-large-v3.bin"
-PROMPT_VERSION = 4
+PROMPT_VERSION = 5
 CHUNK_SECONDS = 1_200.0
 CHUNK_CONTEXT_SECONDS = 90.0
 MAX_ANALYSIS_WORKERS = 3
@@ -571,8 +571,9 @@ comment for other audience speech that should be removed because its room audio 
 survives before the recording ends. Use zero for answer times when there is no answer.
 
 For every faq, write a concise {project.get('copy_language', project.get('language', 'de'))} on-screen question,
-maximum 68 characters. Reconstruct its meaning using the
-answer and slides; do not say it was reconstructed. source_start/source_end are exact source-video seconds for the
+maximum 68 characters. Paraphrase the audience contribution itself. Use the answer and slides only to resolve
+ambiguous references or expand acronyms; never import a separate process or noun that appears only in the answer.
+Do not say the question was reconstructed. source_start/source_end are exact source-video seconds for the
 audience contribution. answer_start/answer_end are exact source-video seconds for the presenter answer. Follow-ups and
 comments may point to the next presenter answer. Never invent a topic absent from transcript and slides. Prefer recall
 over silently leaving audience audio in.
