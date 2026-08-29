@@ -6,8 +6,13 @@ import json
 import os
 import re
 import subprocess
+import tempfile
+import textwrap
 import threading
+import time
 from pathlib import Path
+
+from PIL import Image, ImageDraw, ImageFont
 
 from video_common import (
     atomic_write_json,
@@ -20,21 +25,36 @@ from video_common import (
     host_capabilities,
     presentation_bounds,
     project_path,
+    resolve_project_path,
     require_privacy_provenance,
+    speaker_position,
     source_to_output,
     timeline_events_in_range,
     whisper_tokens,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-WIDTH, HEIGHT = 2160, 3840
+WIDTH, HEIGHT = 1080, 1920
 WHISPER = ROOT / "build/whisper.cpp/build/bin/whisper-cli"
 WHISPER_MODEL = Path.home() / ".cache/openwhispr/whisper-models/ggml-large-v3.bin"
 
 
+def command_attempts(command: list[str]) -> int:
+    return 3 if "h264_videotoolbox" in command else 1
+
+
 def run(command: list[str]) -> None:
     print("+", " ".join(command))
-    subprocess.run(command, check=True)
+    attempts = command_attempts(command)
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run(command, check=False)
+        if result.returncode == 0:
+            return
+        if attempt < attempts:
+            print(f"VideoToolbox encode failed; retrying ({attempt}/{attempts - 1})")
+            time.sleep(attempt)
+            continue
+        result.check_returncode()
 
 
 def source_to_final(source_time: float, project: dict) -> float:
@@ -116,6 +136,83 @@ def clean_caption(text: str, replacements: dict[str, str] | None = None) -> str:
     for pattern, replacement in (replacements or {}).items():
         text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
     return text
+
+
+def validate_clips(clips: list[dict]) -> list[dict]:
+    ids = set()
+    for clip in clips:
+        clip_id = str(clip.get("id", ""))
+        title = str(clip.get("title", "")).strip()
+        hook = str(clip.get("hook", title)).strip()
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", clip_id):
+            raise SystemExit(f"invalid Short id: {clip_id!r}")
+        if clip_id in ids:
+            raise SystemExit(f"duplicate Short id: {clip_id}")
+        if not title or len(title) > 100:
+            raise SystemExit(f"short {clip_id} title must contain 1 to 100 characters")
+        if not hook or len(hook) > 100:
+            raise SystemExit(f"short {clip_id} hook must contain 1 to 100 characters")
+        ids.add(clip_id)
+    return clips
+
+
+def short_output_name(index: int, clip: dict) -> str:
+    return f"{index:02d}-{clip['id']}.mp4"
+
+
+def make_hook_image(text: str, output: Path, font: Path | None = None) -> None:
+    lines = textwrap.wrap(text, width=28)
+    if len(lines) > 3:
+        raise SystemExit("Short hook must fit on three lines")
+    image = Image.new("RGBA", (WIDTH, 360), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    hook_font = ImageFont.truetype(font, 48) if font else ImageFont.load_default(size=48)
+    draw.rounded_rectangle((48, 40, WIDTH - 48, 320), radius=26, fill=(0, 0, 0, 190))
+    draw.rounded_rectangle((48, 40, 58, 320), radius=5, fill="#eb0028")
+    draw.multiline_text(
+        (WIDTH / 2, 180),
+        "\n".join(lines),
+        font=hook_font,
+        fill="white",
+        spacing=12,
+        anchor="mm",
+        align="center",
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    image.save(output)
+
+
+def automatic_pan(
+    timeline: dict,
+    track: list[dict],
+    source_start: float,
+    duration: float,
+    crop_width: float,
+    source_scale: float,
+) -> list[list[float]]:
+    speaker_width = float(timeline["speaker_crop"]["width"])
+    offsets = [0.0]
+    offsets.extend(float(value) for value in range(4, int(duration), 4))
+    offsets.append(duration)
+    maximum = float(timeline["source_width"]) - crop_width
+    return [
+        [
+            round(offset, 3),
+            round(
+                max(
+                    0.0,
+                    min(
+                        maximum,
+                        speaker_position(track, source_start + offset)[0]
+                        + (speaker_width - crop_width) / 2,
+                    ),
+                )
+                / source_scale,
+                3,
+            ),
+        ]
+        for offset in offsets
+    ]
 
 
 def transcript_words(data: dict) -> list[dict]:
@@ -269,9 +366,28 @@ def render_clip(
     source_scale, crop_width, crop_height, mask_width, mask_height = short_crop_geometry(
         source_width, source_height
     )
-    crop_x = f"({pan_expression(clip['pan'])})*{source_scale:.9f}"
-    crop_y = float(clip.get("crop_y", 480)) * source_scale
-    if crop_width > source_width or crop_height > source_height or crop_y + crop_height > source_height:
+    if clip.get("pan"):
+        pan = clip["pan"]
+    else:
+        track = json.loads(
+            resolve_project_path(project, timeline["speaker_track"]).read_text(encoding="utf-8")
+        )
+        pan = automatic_pan(
+            timeline, track, source_start, duration, crop_width, source_scale
+        )
+    crop_x = f"({pan_expression(pan)})*{source_scale:.9f}"
+    crop_y = (
+        float(clip["crop_y"]) * source_scale
+        if "crop_y" in clip
+        else float(timeline["speaker_crop"]["y"])
+        + (float(timeline["speaker_crop"]["height"]) - crop_height) / 2
+    )
+    if (
+        crop_width > source_width
+        or crop_height > source_height
+        or crop_y < 0
+        or crop_y + crop_height > source_height
+    ):
         raise SystemExit(f"short {clip['id']} crop exceeds source geometry")
     mask_x = f"({crop_x})*960/{source_width:.9f}"
     mask_y = crop_y * 540 / source_height
@@ -296,7 +412,11 @@ def render_clip(
     encoder = project["_video_encoder"]
     render_threads = str(project["_render_threads"])
     encoding = encoder_options(encoder, "ultrafast")
-    encoding.extend(("-crf", "18") if encoder == "libx264" else ("-b:v", "20M"))
+    encoding.extend(
+        ("-crf", "18")
+        if encoder == "libx264"
+        else ("-b:v", str(project.get("shorts_video_bitrate", "8M")))
+    )
     run([
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", *decoder_options(),
         "-ss", f"{source_start:.3f}", "-i", str(raw_video),
@@ -318,15 +438,25 @@ def render_clip(
         "-threads", render_threads, str(normalized_audio),
     ])
     temporary_output = output.with_name(f".{output.stem}.tmp{output.suffix}")
+    hook_image = clip_build / "hook.png"
+    configured_font = project.get("shorts_font", project.get("faq_font"))
+    make_hook_image(
+        str(clip.get("hook", clip["title"])),
+        hook_image,
+        resolve_project_path(project, configured_font) if configured_font else None,
+    )
     try:
         run([
             "ffmpeg", "-hide_banner", "-loglevel", "warning", "-y",
             "-i", str(private_video), "-i", str(normalized_audio),
             "-loop", "1", "-framerate", "30", "-i", str(logo_source),
+            "-loop", "1", "-framerate", "30", "-i", str(hook_image),
             "-filter_complex_threads", render_threads,
-            "-filter_complex", f"[2:v]scale={int(project.get('shorts_logo_width', 360))}:-1,format=rgba,"
+            "-filter_complex", f"[2:v]scale={int(project.get('shorts_logo_width', 180))}:-1,format=rgba,"
             f"colorchannelmixer=aa={float(project.get('shorts_logo_opacity', 0.55)):.3f}[mark];"
-            "[0:v][mark]overlay=96:96:eof_action=pass[outv]",
+            "[3:v]format=rgba[hook];"
+            "[0:v][mark]overlay=48:48:eof_action=pass[branded];"
+            f"[branded][hook]overlay=0:180:enable='lt(t,{float(project.get('shorts_hook_seconds', 3.0)):.3f})'[outv]",
             "-map", "[outv]", "-map", "1:a:0", "-t", f"{duration:.3f}",
             *encoding,
             "-threads", render_threads,
@@ -343,7 +473,7 @@ def render_clip(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Render clean vertical 4K Shorts from the original meetup video.")
+    parser = argparse.ArgumentParser(description="Render clean vertical 1080p Shorts from the original meetup video.")
     parser.add_argument("--project", type=Path, default=ROOT / "video-project.json")
     parser.add_argument("--manifest", type=Path, default=ROOT / "shorts.json")
     parser.add_argument("--only", action="append", help="Render only the named clip; may be repeated.")
@@ -370,6 +500,7 @@ def main() -> None:
     if project.get("whisper_model"):
         WHISPER_MODEL = project_path(project, "whisper_model")
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    all_clips = validate_clips(manifest["clips"])
     raw_video = project_path(project, "video")
     final_video = project_path(project, "final_output")
     if not raw_video.exists() or not final_video.exists():
@@ -415,15 +546,30 @@ def main() -> None:
     project_dir = Path(project["_project_dir"])
     build = project_dir / "build/shorts"
     output_dir = project_dir / "output/shorts"
+    metadata_path = project_dir / "output/metadata/shorts.json"
     build.mkdir(parents=True, exist_ok=True)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    clips = [clip for clip in manifest["clips"] if not args.only or clip["id"] in args.only]
-    if not clips:
-        raise SystemExit("no matching clips")
+    indexed_clips = [
+        (index, clip)
+        for index, clip in enumerate(all_clips, 1)
+        if not args.only or clip["id"] in args.only
+    ]
+    if not indexed_clips:
+        if args.only:
+            raise SystemExit("no matching clips")
+        atomic_write_json(
+            metadata_path,
+            {"version": 1, "status": "no-approved-clips", "clips": []},
+        )
+        print(metadata_path)
+        return
+    clips = [clip for _index, clip in indexed_clips]
     gpu_slots = threading.Semaphore(args.gpu_jobs)
-    def render_one(clip: dict) -> Path:
-        output = output_dir / f"{clip['id']}.mp4"
+
+    def render_one(item: tuple[int, dict]) -> Path:
+        index, clip = item
+        output = output_dir / short_output_name(index, clip)
         render_clip(
             raw_video, final_video, logo_source, privacy_mask, full_blur_mask,
             clip, project, output, build, gpu_slots,
@@ -431,7 +577,7 @@ def main() -> None:
         return output
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(args.jobs, len(clips))) as executor:
-        outputs = list(executor.map(render_one, clips))
+        outputs = list(executor.map(render_one, indexed_clips))
 
     concat = build / "review.ffconcat"
     atomic_write_text(
@@ -445,12 +591,58 @@ def main() -> None:
         "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-ac", "2",
         "-movflags", "+faststart", str(review),
     ])
+    atomic_write_json(
+        metadata_path,
+        {
+            "version": 1,
+            "status": "ready",
+            "clips": [
+                {
+                    "id": clip["id"],
+                    "title": clip["title"],
+                    "hook": clip.get("hook", clip["title"]),
+                    "source_start": clip["source_start"],
+                    "duration": clip["duration"],
+                    "video": str(output.relative_to(project_dir)),
+                    "subtitles": str(output.with_suffix(".srt").relative_to(project_dir)),
+                }
+                for clip, output in zip(clips, outputs, strict=True)
+            ],
+        },
+    )
     print(review)
 
 
 def self_test() -> None:
+    assert command_attempts(["ffmpeg", "-c:v", "h264_videotoolbox"]) == 3
+    assert command_attempts(["ffmpeg", "-c:v", "libx264"]) == 1
     assert short_crop_geometry(3840, 2160) == (1, 900, 1600, 225, 400)
     assert short_crop_geometry(1920, 1080) == (0.5, 450, 800, 225, 400)
+    assert short_output_name(2, {"id": "clear-title"}) == "02-clear-title.mp4"
+    assert validate_clips([{"id": "clear-title", "title": "Clear title"}])
+    try:
+        validate_clips([{"id": "missing-title"}])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("Shorts without titles must fail")
+    pan = automatic_pan(
+        {
+            "source_width": 3840,
+            "speaker_crop": {"width": 1008},
+        },
+        [{"time": 0, "x": 400}, {"time": 10, "x": 600}],
+        0,
+        10,
+        900,
+        1,
+    )
+    assert pan[0][1] == 454 and pan[-1][1] == 574
+    with tempfile.TemporaryDirectory() as directory:
+        hook = Path(directory) / "hook.png"
+        make_hook_image("A useful Short title", hook)
+        with Image.open(hook) as image:
+            assert image.size == (WIDTH, 360) and image.mode == "RGBA"
     assert presentation_range_matches(
         {"presentation_start": 12.5, "presentation_end": 20.0},
         {"identity": {"presentation_start": 12.5, "presentation_end": 20.0}},

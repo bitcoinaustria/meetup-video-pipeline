@@ -38,7 +38,7 @@
   "presentation_end": null,
   "shorts_manifest": "shorts.json",
   "shorts_logo": "CoverLogo.png",
-  "shorts_logo_width": 360,
+  "shorts_logo_width": 180,
   "shorts_logo_opacity": 0.55,
   "caption_replacements": {},
   "final_output": "output/final/final-4k.mp4",

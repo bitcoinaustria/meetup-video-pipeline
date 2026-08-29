@@ -157,6 +157,7 @@ make audio PROJECT=projects/my-talk/project.json ANALYZER=codex
 make faq PROJECT=projects/my-talk/project.json ANALYZER=codex
 make final PROJECT=projects/my-talk/project.json ANALYZER=codex
 make shorts PROJECT=projects/my-talk/project.json
+make clean-debug PROJECT=projects/my-talk/project.json
 make copy PROJECT=projects/my-talk/project.json ANALYZER=codex
 make chapters PROJECT=projects/my-talk/project.json
 make validate PROJECT=projects/my-talk/project.json
@@ -167,7 +168,9 @@ platform detector/OCR availability in `build/host-capabilities.json`, and report
 Selection is automatic: VideoToolbox on supported Macs, NVENC/QSV/AMF where their FFmpeg
 encoder really initializes, and `libx264` otherwise. The project manifest stores only
 `acceleration: auto|off|required`; machine-specific results stay out of the portable manifest
-and are recorded in build data and the final-render sidecar.
+and are recorded in build data and the final-render sidecar. Production commands reuse a successful
+capability result while its host, FFmpeg, encoder, resolution, and detector signature remain unchanged;
+`make capabilities` always performs a fresh probe.
 
 Analysis uses an automatic run-wide budget. Maintainers can reproduce constrained runs with
 `JOBS=`, `GPU_JOBS=`, and `RENDER_JOBS=`; ordinary users should leave them unset. GPU inference
@@ -179,7 +182,7 @@ agent selects or overrides it with `ANALYZER=codex` (or `claude`); optional
 `audio_analyzer`, `faq_analyzer`, and `publishing_analyzer` settings override individual
 stages. The generator has no vendor-specific default.
 
-`make final` rebuilds context-gated speech edits and audience FAQ coverage, renders at `final_resolution`, validates stereo audio and visible frames, then atomically replaces the configured final output. `make release` additionally regenerates grounded publishing copy. A short 1080p preview followed by explicit `make approve` is the required approval gate before an expensive production render.
+`make final` rebuilds context-gated speech edits and audience FAQ coverage, reuses an already-current validated final, or renders at `final_resolution` and atomically replaces the configured output. `make release` additionally regenerates grounded publishing copy and renders approved Shorts. An empty Shorts manifest is recorded explicitly in `output/metadata/shorts.json`. A short 1080p preview followed by explicit `make approve` is the required approval gate before an expensive production render.
 
 Privacy approval is content-addressed: `make privacy-seal` binds both masks to the source hash, talk range, geometry, every participant track, qualified detector artifacts, and repository-approved labeled dataset. Preview approval then binds the complete render inputs. Any drift stops final rendering or validation until the affected review is repeated. Final validation samples known full-blur intervals in every active camera panel, and the final-render sidecar binds Shorts to the exact final file and current EDL/FAQ hashes.
 
@@ -197,6 +200,9 @@ output/
 ```
 
 Source media remains in the project's `source/` directory. Intermediate assets belong in `build/` or `tmp/`, not in `output/`.
+`make clean-debug PROJECT=...` removes the deletable review tree and legacy render-lock guards after approval; active locks live under `build/locks/`.
+
+Each approved Short needs a stable lowercase `id`, a publishable `title`, `source_start`, and `duration`. The renderer creates numbered readable 1080×1920 files, a matching SRT, and `output/metadata/shorts.json`. A `hook` can override the title shown briefly in the video. Crop and pan default to the reviewed speaker track; `crop_y` and `pan` remain optional manual overrides.
 
 ## Safety and edit contract
 
