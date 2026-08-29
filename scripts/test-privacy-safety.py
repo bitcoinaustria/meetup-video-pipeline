@@ -19,6 +19,21 @@ assert privacy.privacy_action(speaker, [separate_person]) == "blur-others"
 assert privacy.privacy_action(None, [separate_person]) == "full-blur"
 assert privacy.privacy_action(None, []) == "full-blur"
 
+crop_timeline = {
+    "source_width": 1000,
+    "source_height": 500,
+    "speaker_crop": {"width": 400, "height": 500, "y": 0},
+}
+crop_track = [{"time": 0, "x": 100}, {"time": 1, "x": 100}]
+inside = privacy.Box(0.20, 0.10, 0.10, 0.50)
+outside = privacy.Box(0.70, 0.10, 0.10, 0.50)
+cropped = privacy.crop_detections(
+    [(0.0, [inside, outside])], 0.0, crop_timeline, crop_track, {}
+)
+assert cropped == [(0.0, [inside])]
+assert privacy.problem_windows(cropped, 1.0, 0.0) == []
+assert privacy.problem_windows([(0.0, [inside, inside])], 1.0, 0.0) == [(0, 1.0)]
+
 participants = {
     "host_a": {"crop": {"width": 100}},
     "host_b": {"crop": {"width": 100}},

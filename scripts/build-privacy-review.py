@@ -24,6 +24,7 @@ from video_common import (
     parse_detection_coordinates,
     privacy_detector_command,
     resolve_project_path,
+    speaker_position,
     validate_speaker_track,
     validate_timeline,
 )
@@ -99,6 +100,87 @@ def track_sample(track: list[dict], timestamp: float) -> dict:
     )
 
 
+def box_intersects_crop(
+    box: Box, crop: dict, source_width: float, source_height: float
+) -> bool:
+    crop_left = float(crop["x"]) / source_width
+    crop_right = (float(crop["x"]) + float(crop["width"])) / source_width
+    crop_top = float(crop["y"]) / source_height
+    crop_bottom = (float(crop["y"]) + float(crop["height"])) / source_height
+    box_top = 1 - box.y - box.height
+    box_bottom = 1 - box.y
+    return (
+        min(box.x + box.width, crop_right) > max(box.x, crop_left)
+        and min(box_bottom, crop_bottom) > max(box_top, crop_top)
+    )
+
+
+def rendered_crops(
+    timestamp: float,
+    timeline: dict,
+    primary_track: list[dict],
+    participant_tracks: dict[str, list[dict]],
+) -> list[dict]:
+    section = next(
+        (
+            item
+            for item in timeline.get("layout_sections", [])
+            if item["layout"] == "dual_speaker"
+            and float(item["source_start"]) <= timestamp < float(item["source_end"])
+        ),
+        None,
+    )
+    if section:
+        crops = []
+        for side in ("left", "right"):
+            name = section[side]
+            track = participant_tracks[name]
+            if track_sample(track, timestamp)["visible"]:
+                crops.append(
+                    {
+                        **timeline["participants"][name]["crop"],
+                        "x": speaker_position(track, timestamp)[0],
+                    }
+                )
+        return crops
+    return [
+        {
+            **timeline["speaker_crop"],
+            "x": speaker_position(primary_track, timestamp)[0],
+        }
+    ]
+
+
+def crop_detections(
+    detections: list[tuple[float, list[Box]]],
+    source_offset: float,
+    timeline: dict,
+    primary_track: list[dict],
+    participant_tracks: dict[str, list[dict]],
+) -> list[tuple[float, list[Box]]]:
+    source_width = float(timeline.get("source_width", 3840))
+    source_height = float(timeline.get("source_height", 2160))
+    return [
+        (
+            timestamp,
+            [
+                box
+                for box in boxes
+                if any(
+                    box_intersects_crop(box, crop, source_width, source_height)
+                    for crop in rendered_crops(
+                        source_offset + timestamp,
+                        timeline,
+                        primary_track,
+                        participant_tracks,
+                    )
+                )
+            ],
+        )
+        for timestamp, boxes in detections
+    ]
+
+
 def dual_speakers_and_others(
     boxes: list[Box],
     timestamp: float,
@@ -146,12 +228,12 @@ def dual_speakers_and_others(
 
 
 def problem_windows(
-    path: Path,
+    detections: list[tuple[float, list[Box]]],
     duration: float,
     padding: float,
     required: list[tuple[float, float]] | None = None,
 ) -> list[tuple[float, float]]:
-    times = [timestamp for timestamp, boxes in read_detections(path) if len(boxes) > 1]
+    times = [timestamp for timestamp, boxes in detections if len(boxes) > 1]
     windows = [
         (max(0, start - padding), min(duration, end + padding))
         for start, end in (required or [])
@@ -244,8 +326,10 @@ def add_appearance(frames: list[Path], detections: list[tuple[float, list[Box]]]
                 box.contrast = stats.stddev[0]
 
 
-def speaker_reference(detections: Path, samples: Path) -> tuple[float, float] | None:
-    rows = [row for row in read_detections(detections) if len(row[1]) == 1]
+def speaker_reference(
+    detections: list[tuple[float, list[Box]]], samples: Path
+) -> tuple[float, float] | None:
+    rows = [row for row in detections if len(row[1]) == 1]
     rows = rows[::max(1, len(rows) // 100)]
     pairs = [
         (row, samples / f"frame-{round(row[0]) + 1:05d}.jpg")
@@ -352,6 +436,47 @@ def make_mask(
     shutil.rmtree(masks)
     shutil.rmtree(cuts)
     return output, cut_output
+
+
+def assemble_mask(
+    windows: list[tuple[float, float]],
+    segments: list[Path],
+    duration: float,
+    output: Path,
+) -> None:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output.with_name(f".{output.stem}.tmp{output.suffix}")
+    command = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "lavfi", "-i",
+        f"color=c=black:s={MASK_SIZE[0]}x{MASK_SIZE[1]}:r={MASK_FPS}:d={duration:.6f}",
+    ]
+    for segment in segments:
+        command.extend(("-i", str(segment)))
+    filters = ["[0:v]format=yuv420p[base0]"]
+    for index, ((start, end), _segment) in enumerate(
+        zip(windows, segments, strict=True), 1
+    ):
+        filters.extend(
+            (
+                f"[{index}:v]setpts=PTS-STARTPTS+{start:.6f}/TB[segment{index}]",
+                f"[base{index - 1}][segment{index}]overlay=eof_action=pass:shortest=0:"
+                f"enable='between(t,{start:.6f},{end:.6f})'[base{index}]",
+            )
+        )
+    try:
+        run(
+            command
+            + [
+                "-filter_complex", ";".join(filters),
+                "-map", f"[base{len(segments)}]", "-t", f"{duration:.6f}", "-an",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "0",
+                "-pix_fmt", "yuv420p", str(temporary),
+            ]
+        )
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def extract_and_detect(
@@ -462,13 +587,45 @@ def main() -> None:
     timeline_path = resolve_project_path(project, project.get("timeline", "timeline.json"))
     timeline = json.loads(timeline_path.read_text(encoding="utf-8"))
     validate_timeline(timeline)
+    source_width = float(timeline.get("source_width", 3840))
+    primary_track = json.loads(
+        resolve_project_path(project, timeline["speaker_track"]).read_text(encoding="utf-8")
+    )
+    validate_speaker_track(
+        primary_track,
+        float(timeline["duration"]),
+        timeline["speaker_crop"],
+        source_width,
+    )
+    participants = timeline.get("participants", {})
+    participant_tracks = {
+        name: json.loads(
+            resolve_project_path(project, participant["track"]).read_text(encoding="utf-8")
+        )
+        for name, participant in participants.items()
+    }
+    for name, track_data in participant_tracks.items():
+        validate_speaker_track(
+            track_data,
+            float(timeline["duration"]),
+            participants[name]["crop"],
+            source_width,
+            visibility=True,
+        )
     dual_sections = [
         section
         for section in timeline.get("layout_sections", [])
         if section["layout"] == "dual_speaker"
     ]
+    coarse_detections = crop_detections(
+        read_detections(args.coarse_detections),
+        0.0,
+        timeline,
+        primary_track,
+        participant_tracks,
+    )
     windows = problem_windows(
-        args.coarse_detections,
+        coarse_detections,
         float(timeline["duration"]),
         args.padding,
         [
@@ -478,14 +635,7 @@ def main() -> None:
     )
     if not windows:
         raise SystemExit("no multi-person privacy windows found")
-    reference = speaker_reference(args.coarse_detections, args.samples)
-    participants = timeline.get("participants", {})
-    participant_tracks = {
-        name: json.loads(
-            resolve_project_path(project, participant["track"]).read_text(encoding="utf-8")
-        )
-        for name, participant in participants.items()
-    }
+    reference = speaker_reference(coarse_detections, args.samples)
     dual_names = {
         section[side]
         for section in dual_sections
@@ -494,15 +644,6 @@ def main() -> None:
     participant_appearance = participant_references(
         {name: participant_tracks[name] for name in dual_names}, args.samples
     )
-    source_width = float(timeline.get("source_width", 3840))
-    for name, track_data in participant_tracks.items():
-        validate_speaker_track(
-            track_data,
-            float(timeline["duration"]),
-            participants[name]["crop"],
-            source_width,
-            visibility=True,
-        )
     build = base / "build/privacy-review"
     build.mkdir(parents=True, exist_ok=True)
     clips: list[Path] = []
@@ -518,6 +659,13 @@ def main() -> None:
         window_dir.mkdir(parents=True)
         detections = extract_and_detect(
             args.video, window_dir, start, end - start, detector_command
+        )
+        detections = crop_detections(
+            detections,
+            start,
+            timeline,
+            primary_track,
+            participant_tracks,
         )
         primary_speakers, primary_others = speaker_and_others(detections, reference)
         speakers: list[list[Box] | None] = [
@@ -596,6 +744,19 @@ def main() -> None:
         "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-safe", "0", "-f", "concat", "-i", str(concat),
         "-c", "copy", "-movflags", "+faststart", str(args.output),
     ])
+    if project.get("privacy_mask") and project.get("full_blur_mask"):
+        assemble_mask(
+            windows,
+            masks,
+            float(timeline["duration"]),
+            resolve_project_path(project, project["privacy_mask"]),
+        )
+        assemble_mask(
+            windows,
+            cuts,
+            float(timeline["duration"]),
+            resolve_project_path(project, project["full_blur_mask"]),
+        )
     print(f"{len(windows)} windows -> {args.output}")
     for start, end in windows:
         print(f"{format_time(start)}-{format_time(end)}")
