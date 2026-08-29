@@ -355,6 +355,14 @@ def host_capabilities(project: dict, *, refresh: bool = False) -> dict:
     cache_key = json.dumps(signature, ensure_ascii=False, sort_keys=True)
     if not refresh and cache_key in _HOST_CAPABILITY_CACHE:
         return _HOST_CAPABILITY_CACHE[cache_key]
+    if not refresh and output.exists():
+        try:
+            cached_profile = json.loads(output.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached_profile = None
+        if cached_profile and cached_profile.get("signature") == signature:
+            _HOST_CAPABILITY_CACHE[cache_key] = cached_profile
+            return cached_profile
 
     policy = signature["acceleration"]
     if policy not in {"auto", "off", "required"}:

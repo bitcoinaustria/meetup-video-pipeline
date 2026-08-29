@@ -10,6 +10,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import video_common
+
 from video_common import (
     _command_status,
     analysis_range_matches,
@@ -318,6 +320,12 @@ with tempfile.TemporaryDirectory() as directory:
             "probes": [{"encoder": "libx265", "available": True, "detail": ""}],
         }
         assert profile["privacy_detector"]["qualified"]
+        video_common._HOST_CAPABILITY_CACHE.clear()
+        with patch(
+            "video_common._encoder_works",
+            side_effect=AssertionError("disk capability cache missed"),
+        ):
+            assert host_capabilities(capability_project) == profile
         qualification.write_text(
             json.dumps(
                 {

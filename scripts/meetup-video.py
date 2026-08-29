@@ -51,6 +51,7 @@ from video_common import (
 
 ROOT = Path(__file__).resolve().parent.parent
 GIB = 1024**3
+RENDER_CONTRACT_VERSION = 1  # Bump when shared helpers change encoded output.
 
 
 def load_project(path: Path) -> dict:
@@ -310,8 +311,6 @@ def render_identity(project: dict) -> dict:
         for name, path in participant_track_paths(project, timeline).items()
     }
     files["renderer"] = fingerprint("renderer", ROOT / "scripts/render-video.py")
-    files["controller"] = fingerprint("controller", Path(__file__).resolve())
-    files["common"] = fingerprint("common", ROOT / "scripts/video_common.py")
     audio_edits = optional_project_path(project, "audio_edits")
     if audio_edits and audio_edits.exists():
         files["audio_edits"] = fingerprint("audio-edits", audio_edits)
@@ -334,6 +333,7 @@ def render_identity(project: dict) -> dict:
         "presentation_start": float(project["presentation_start"]),
         "presentation_end": project.get("presentation_end"),
         "render": {
+            "contract": RENDER_CONTRACT_VERSION,
             "resolution": project.get("final_resolution", "3840x2160"),
             "encoder": profile["video_encoder"]["name"],
             "ffmpeg": profile["signature"]["ffmpeg_version"],
@@ -383,10 +383,22 @@ def require_current_final_metadata(project: dict, path: Path) -> None:
         metadata = json.loads(final_metadata_path(project).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
         raise SystemExit("final render metadata is missing or invalid") from error
-    if metadata.get("identity", {}).get("sha256") != render_identity(project)["sha256"]:
+    if comparable_render_identity(metadata.get("identity", {})) != comparable_render_identity(
+        render_identity(project)
+    ):
         raise SystemExit("final render metadata is stale for the current project inputs")
     if metadata.get("artifact") != content_fingerprint(path):
         raise SystemExit("final render does not match its metadata")
+
+
+def comparable_render_identity(identity: dict) -> dict:
+    payload = {key: value for key, value in identity.items() if key != "sha256"}
+    files = dict(payload.get("files", {}))
+    files.pop("controller", None)  # Legacy metadata included non-rendering orchestration code.
+    files.pop("common", None)
+    render = dict(payload.get("render", {}))
+    render.setdefault("contract", 1)
+    return {**payload, "files": files, "render": render}
 
 
 def validate_render(
@@ -1115,6 +1127,24 @@ def final_render(project: dict, project_file: Path) -> None:
     output = project_path(project, "final_output")
     output.parent.mkdir(parents=True, exist_ok=True)
     identity = render_identity(project)
+    if output.is_file():
+        try:
+            require_current_final_metadata(project, output)
+            validate_render(
+                output,
+                project.get("final_resolution", "3840x2160"),
+                expected_render_duration(project),
+            )
+            validate_privacy_render(
+                output,
+                project,
+                project.get("final_resolution", "3840x2160"),
+            )
+        except SystemExit:
+            pass
+        else:
+            print(f"current final already valid: {output}")
+            return
     approval_path = preview_approval_path(project)
     try:
         approval = json.loads(approval_path.read_text(encoding="utf-8"))
@@ -1125,7 +1155,11 @@ def final_render(project: dict, project_file: Path) -> None:
     if approval.get("approved") is not True:
         raise SystemExit("preview exists but is not explicitly approved")
     privacy_preflight(project, project_file, identity=identity)
-    lock = output.with_suffix(output.suffix + ".lock")
+    lock = (
+        Path(project["_project_dir"])
+        / "build/locks"
+        / f"{output.name}.lock"
+    )
     temporary = output.with_name(f"{output.stem}.rendering{output.suffix}")
     lock_handle = acquire_render_lock(lock)
     try:
@@ -1324,6 +1358,23 @@ def render_shorts(project: dict, project_file: Path) -> None:
     )
 
 
+def clean_debug(project: dict) -> None:
+    project_dir = Path(project["_project_dir"])
+    debug = project_dir / "output/debug"
+    reclaimed = (
+        sum(path.stat().st_size for path in debug.rglob("*") if path.is_file())
+        if debug.exists()
+        else 0
+    )
+    shutil.rmtree(debug, ignore_errors=True)
+    for metadata in (project_dir / "output").rglob(".DS_Store"):
+        metadata.unlink()
+    for guard in (project_dir / "output/final").glob("*.lock.guard"):
+        if not Path(str(guard).removesuffix(".guard")).exists():
+            guard.unlink()
+    print(f"removed output/debug ({reclaimed / 1024**2:.1f} MiB)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="One-command meetup video workflow.")
     parser.add_argument("--project", type=Path, default=ROOT / "video-project.json")
@@ -1353,6 +1404,7 @@ def main() -> None:
     subparsers.add_parser("audio")
     subparsers.add_parser("faq")
     subparsers.add_parser("shorts")
+    subparsers.add_parser("clean-debug")
     validate = subparsers.add_parser("validate")
     validate.add_argument("--input", type=Path)
     validate.add_argument("--resolution", choices=("3840x2160", "1920x1080"))
@@ -1426,6 +1478,8 @@ def main() -> None:
         build_faq(project, args.project, args.analyzer)
     elif args.command == "shorts":
         render_shorts(project, args.project)
+    elif args.command == "clean-debug":
+        clean_debug(project)
     elif args.command == "validate":
         target = args.input or project_path(project, "final_output")
         resolution = args.resolution or (
@@ -1448,6 +1502,8 @@ def main() -> None:
         if args.command == "release":
             publishing_copy(project, args.project, args.analyzer)
         final_render(project, args.project)
+        if args.command == "release":
+            render_shorts(project, args.project)
 
 
 if __name__ == "__main__":

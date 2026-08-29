@@ -400,6 +400,43 @@ def main() -> None:
         else:
             raise AssertionError("OS-held render lock must reject a second contender")
         meetup_video.release_render_lock(contended_lock, contended_handle)
+        current_identity = {
+            "sha256": "current",
+            "render": {"contract": 1},
+            "files": {"renderer": {"sha256": "same"}},
+        }
+        legacy_identity = {
+            "sha256": "legacy",
+            "files": {
+                "renderer": {"sha256": "same"},
+                "controller": {"sha256": "orchestration-only"},
+                "common": {"sha256": "legacy-whole-file-hash"},
+            },
+        }
+        assert meetup_video.comparable_render_identity(
+            current_identity
+        ) == meetup_video.comparable_render_identity(legacy_identity)
+        debug_file = temporary_path / "output/debug/preview.mp4"
+        debug_file.parent.mkdir(parents=True, exist_ok=True)
+        debug_file.write_bytes(b"review")
+        legacy_guard = temporary_path / "output/final/final.mp4.lock.guard"
+        legacy_guard.parent.mkdir(parents=True, exist_ok=True)
+        legacy_guard.touch()
+        finder_metadata = temporary_path / "output/.DS_Store"
+        finder_metadata.touch()
+        active_lock = temporary_path / "output/final/active.mp4.lock"
+        active_lock.mkdir()
+        active_guard = Path(f"{active_lock}.guard")
+        active_guard.touch()
+        meetup_video.clean_debug({"_project_dir": str(temporary_path)})
+        assert (
+            not debug_file.parent.exists()
+            and not legacy_guard.exists()
+            and not finder_metadata.exists()
+            and active_guard.exists()
+        )
+        active_guard.unlink()
+        active_lock.rmdir()
         for owner in ({"pid": os.getpid()}, None):
             blocked_lock = temporary_path / f"blocked-{owner is None}.lock"
             blocked_lock.mkdir()
@@ -499,6 +536,13 @@ def main() -> None:
         edl.write_bytes(approved_edl)
         with patch.object(meetup_video, "host_capabilities", return_value=test_profile):
             meetup_video.final_render(loaded_project, project)
+        with (
+            patch.object(meetup_video, "host_capabilities", return_value=test_profile),
+            patch.object(meetup_video, "render", side_effect=AssertionError("final cache missed")),
+        ):
+            meetup_video.final_render(loaded_project, project)
+        assert not list((project.parent / "output/final").glob("*.lock.guard"))
+        assert list((project.parent / "build/locks").glob("*.lock.guard"))
         preflight = json.loads(
             (project.parent / "build/privacy-preflight.json").read_text(encoding="utf-8")
         )

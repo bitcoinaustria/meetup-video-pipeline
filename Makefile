@@ -2,7 +2,7 @@ PYTHON := $(shell test -x .venv/bin/python && echo .venv/bin/python || echo pyth
 PROJECT ?= video-project.json
 RUN := $(PYTHON) scripts/meetup-video.py --project "$(PROJECT)" $(if $(ANALYZER),--analyzer $(ANALYZER)) $(if $(JOBS),--jobs $(JOBS)) $(if $(GPU_JOBS),--gpu-jobs $(GPU_JOBS)) $(if $(RENDER_JOBS),--render-jobs $(RENDER_JOBS))
 
-.PHONY: init capabilities check privacy-seal privacy-preflight preview approve copy chapters audio faq shorts validate final release test
+.PHONY: init capabilities check privacy-seal privacy-preflight preview approve copy chapters audio faq shorts clean-debug validate final release test
 
 init:
 	test -n "$(NAME)"
@@ -40,6 +40,9 @@ faq:
 
 shorts:
 	$(RUN) shorts
+
+clean-debug:
+	$(RUN) clean-debug
 
 validate:
 	$(RUN) validate
