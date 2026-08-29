@@ -517,7 +517,8 @@ def main() -> None:
     ) + ";"
     stage += (
         f"[person0]sendcmd=f={commands.name},crop@speaker={source_scaled(person['width'])}:{source_scaled(person['height'])}:{initial_x:.2f}:{source_scaled(person['y'])},"
-        f"scale={layout_scaled(864)}:{layout_scaled(1536)}:flags=lanczos[person];"
+        f"scale={layout_scaled(864)}:{layout_scaled(1536)}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={layout_scaled(864)}:{layout_scaled(1536)}[person];"
         f"[screen0]crop={source_scaled(screen['width'])}:{source_scaled(screen['height'])}:{source_scaled(screen['x'])}:{source_scaled(screen['y'])}[screen-base];"
     )
     if dual_sections:
