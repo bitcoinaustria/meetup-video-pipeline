@@ -781,9 +781,9 @@ def main() -> None:
             command.extend(("-ss", f"{mask_offset:.6f}"))
         command.extend(("-i", str(args.full_blur_mask)))
     for entry in faq_entries:
-        command.extend(("-loop", "1", "-framerate", "30", "-i", str(entry["image"])))
+        command.extend(("-loop", "1", "-framerate", "30", "-t", f"{entry['duration']:.6f}", "-i", str(entry["image"])))
     if args.end_card:
-        command.extend(("-loop", "1", "-framerate", "30", "-i", str(args.end_card)))
+        command.extend(("-loop", "1", "-framerate", "30", "-t", f"{args.end_card_duration:.6f}", "-i", str(args.end_card)))
     command.extend((
         "-filter_complex", filter_graph,
         "-map", video_map, "-map", audio_map,

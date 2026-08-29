@@ -418,7 +418,7 @@ def render_clip(
             "-loop", "1", "-framerate", "30", "-i", str(logo_source),
         ]
         if end_card:
-            command.extend(("-loop", "1", "-framerate", "30", "-i", str(end_card)))
+            command.extend(("-loop", "1", "-framerate", "30", "-t", f"{end_card_duration:.6f}", "-i", str(end_card)))
         filter_graph = f"[2:v]scale={int(project.get('shorts_logo_width', 180))}:-1,format=rgba,"
         filter_graph += (
             f"colorchannelmixer=aa={float(project.get('shorts_logo_opacity', 0.55)):.3f}[mark];"
